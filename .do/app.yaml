@@ -1,0 +1,22 @@
+name: orb-scanner-proxy
+services:
+- name: polygon-proxy
+  source_dir: /
+  github:
+    repo: your-username/your-repo-name
+    branch: main
+  run_command: npm start
+  build_command: npm install
+  environment_slug: node-js
+  instance_count: 1
+  instance_size_slug: basic-xxs
+  envs:
+  - key: POLYGON_API_KEY
+    scope: RUN_AND_BUILD_TIME
+    value: ${POLYGON_API_KEY}
+  - key: PORT
+    scope: RUN_TIME
+    value: "8080"
+  - key: NODE_ENV
+    scope: RUN_TIME
+    value: "production"
