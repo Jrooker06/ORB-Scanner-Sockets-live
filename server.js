@@ -38,7 +38,55 @@ async function makePolygonRequest(path, params = {}) {
   return resp.json();
 }
 
-// NY-market calendar helpers (America/New_York)
+// ---------- Fundamentals (optional) ----------
+const FUND_CACHE = new Map();
+const TTL_MS = 24 * 60 * 60 * 1000;
+const now = () => Date.now();
+
+function cacheGet(key) {
+  const hit = FUND_CACHE.get(key);
+  if (!hit) return null;
+  if (hit.exp < now()) { FUND_CACHE.delete(key); return null; }
+  return hit.val;
+}
+function cacheSet(key, val, ttl = TTL_MS) {
+  FUND_CACHE.set(key, { val, exp: now() + ttl });
+}
+
+// limit concurrency for N async jobs
+async function limitedMap(items, limit, worker) {
+  const out = new Array(items.length);
+  let i = 0;
+  const runners = Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    while (i < items.length) {
+      const idx = i++;
+      out[idx] = await worker(items[idx], idx).catch(() => null);
+    }
+  });
+  await Promise.all(runners);
+  return out;
+}
+
+async function getTickerOverview(ticker) {
+  const key = `ovr:${ticker}`;
+  const cached = cacheGet(key);
+  if (cached) return cached;
+
+  const data = await makePolygonRequest(`/v3/reference/tickers/${encodeURIComponent(ticker)}`);
+  const r = data?.results || {};
+  const out = {
+    // Polygon provides SIC description (industry), market cap, shares outstanding
+    sector: r.sic_description || null,      // "industry" text from SIC
+    sicCode: r.sic_code || null,
+    marketCap: r.market_cap ?? null,
+    weightedSharesOut: r.weighted_shares_outstanding ?? null,
+    shareClassSharesOut: r.share_class_shares_outstanding ?? null
+  };
+  cacheSet(key, out);
+  return out;
+}
+
+// ---------- NY-market calendar helpers ----------
 function ymdNY(d = new Date()) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
@@ -119,8 +167,25 @@ async function computeGainers(limit = 50) {
 app.get("/gainers", async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || "50", 10);
+    const includeFund = /fund|all/i.test(String(req.query.include||""));
+
     const data = await computeGainers(limit);
-    res.json(data);
+    const rows = data.results;
+
+    if (includeFund && rows.length) {
+      await limitedMap(rows, 6, async (row) => {
+        const f = await getTickerOverview(row.ticker);
+        Object.assign(row, {
+          sector: f.sector,
+          sicCode: f.sicCode,
+          marketCap: f.marketCap,
+          sharesOutstanding: f.weightedSharesOut ?? f.shareClassSharesOut
+          // true "free float" not available from Polygon
+        });
+      });
+    }
+
+    res.json({ date: data.date, results: rows });
   } catch (e) {
     res.status(500).json({ error: "Failed to compute gainers", message: String(e.message || e) });
   }
@@ -130,14 +195,30 @@ app.get("/gainers", async (req, res) => {
 app.get("/market/top-gainers", async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || "50", 10);
+    const includeFund = /fund|all/i.test(String(req.query.include||""));
+
     const data = await computeGainers(limit);
-    res.json(data);
+    const rows = data.results;
+
+    if (includeFund && rows.length) {
+      await limitedMap(rows, 6, async (row) => {
+        const f = await getTickerOverview(row.ticker);
+        Object.assign(row, {
+          sector: f.sector,
+          sicCode: f.sicCode,
+          marketCap: f.marketCap,
+          sharesOutstanding: f.weightedSharesOut ?? f.shareClassSharesOut
+        });
+      });
+    }
+
+    res.json({ date: data.date, results: rows });
   } catch (e) {
     res.status(500).json({ error: "Failed to compute gainers", message: String(e.message || e) });
   }
 });
 
-// ----- OHLCV (walk back to last trading day if from/to not given) -----
+// ----- OHLCV (walk back to last trading day if from/to not given) + session filter -----
 app.get("/ohlcv/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
@@ -146,9 +227,10 @@ app.get("/ohlcv/:symbol", async (req, res) => {
       timespan = "minute",
       from,
       to,
-      limit = 500,
+      limit = 5000,
       sort = "asc",
       adjusted = true,
+      session = "all" // 'pre' | 'rth' | 'post' | 'all'
     } = req.query;
 
     let start, end;
@@ -168,7 +250,34 @@ app.get("/ohlcv/:symbol", async (req, res) => {
       { adjusted, sort, limit }
     );
 
-    res.json({ results: Array.isArray(data?.results) ? data.results : [] });
+    let rows = Array.isArray(data?.results) ? data.results : [];
+
+    // Session filter (America/New_York)
+    if (session !== "all" && rows.length) {
+      const inNY = ts => {
+        const d = new Date(ts); // ms
+        const parts = new Intl.DateTimeFormat("en-US", {
+          timeZone: "America/New_York",
+          hour: "2-digit", minute: "2-digit", hour12: false
+        }).formatToParts(d);
+        const hh = +parts.find(p => p.type === "hour").value;
+        const mm = +parts.find(p => p.type === "minute").value;
+        return [hh, mm];
+      };
+      const isPre  = (h,m) => (h > 3 && (h < 9 || (h === 9 && m < 30)));   // 04:00–09:29
+      const isRth  = (h,m) => (h > 9 || (h === 9 && m >= 30)) && h < 16;    // 09:30–15:59
+      const isPost = (h,m) => (h >= 16 && h < 20);                          // 16:00–19:59
+
+      rows = rows.filter(bar => {
+        const [h, m] = inNY(bar.t);
+        if (session === "pre")  return isPre(h,m);
+        if (session === "rth")  return isRth(h,m);
+        if (session === "post") return isPost(h,m);
+        return true;
+      });
+    }
+
+    res.json({ results: rows });
   } catch (e) {
     res.status(500).json({ error: "Failed to fetch OHLCV", message: String(e.message || e) });
   }
