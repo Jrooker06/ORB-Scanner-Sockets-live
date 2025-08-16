@@ -1,4 +1,4 @@
-// server.js — Polygon proxy (NY market–aware)
+// server.js — Polygon proxy (NY market–aware, weekend/holiday-proof)
 // Routes: /health, /gainers, /market/top-gainers, /symbol/:symbol,
 //         /ohlcv/:symbol, /price/:symbol, /previous_close/:symbol
 // Optional WS passthrough at /ws
@@ -14,7 +14,8 @@ const WebSocket = require("ws");
 
 // --- App setup ---
 const app = express();
-app.use(cors());            // tighten later with allowlist
+// You can tighten this with an allowlist later
+app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
@@ -52,13 +53,25 @@ function ymdNY(d = new Date()) {
 }
 function addDays(d, days) { return new Date(d.getTime() + days * 86400000); }
 function todayYMD() { return ymdNY(new Date()); }
-function prevDayYMD() { return ymdNY(addDays(new Date(), -1)); }
 
 async function fetchGrouped(dateStr) {
   return await makePolygonRequest(`/v2/aggs/grouped/locale/us/market/stocks/${dateStr}`, {
     adjusted: true,
     limit: 50000,
   });
+}
+
+// Walk back up to N NY-calendar days to find a trading day with grouped results
+async function findLastTradingDayNY(maxBack = 5) {
+  let d = new Date();
+  for (let i = 0; i < maxBack; i++) {
+    const dateStr = ymdNY(d);
+    const grouped = await fetchGrouped(dateStr);
+    if (grouped?.results?.length) return { dateStr, grouped };
+    d = addDays(d, -1);
+  }
+  // If nothing found, return "yesterday" with empty results
+  return { dateStr: ymdNY(addDays(new Date(), -1)), grouped: { results: [] } };
 }
 
 // --- Routes ---
@@ -81,14 +94,9 @@ app.get("/symbol/:symbol", async (req, res) => {
   }
 });
 
-// Compute gainers from grouped aggregates (works pre/post/closed with fallback)
+// ----- Gainers (computed from grouped aggregates) -----
 async function computeGainers(limit = 50) {
-  let day = todayYMD();
-  let grouped = await fetchGrouped(day);
-  if (!grouped?.results?.length) {
-    day = prevDayYMD();
-    grouped = await fetchGrouped(day);
-  }
+  const { dateStr, grouped } = await findLastTradingDayNY(5);
   const rows = (grouped?.results || [])
     .filter(r => r && typeof r.o === "number" && r.o > 0 && typeof r.c === "number")
     .map(r => {
@@ -100,12 +108,12 @@ async function computeGainers(limit = 50) {
         change: +(r.c - r.o).toFixed(4),
         pctChange: +((pct) * 100).toFixed(2),
         volume: r.v,
-        date: day,
+        date: dateStr,
       };
     })
     .sort((a, b) => b.pctChange - a.pctChange)
     .slice(0, Math.min(limit, 200));
-  return { date: day, results: rows };
+  return { date: dateStr, results: rows };
 }
 
 app.get("/gainers", async (req, res) => {
@@ -129,7 +137,7 @@ app.get("/market/top-gainers", async (req, res) => {
   }
 });
 
-// OHLCV with previous-day fallback when client didn't pin dates
+// ----- OHLCV (walk back to last trading day if from/to not given) -----
 app.get("/ohlcv/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
@@ -143,21 +151,22 @@ app.get("/ohlcv/:symbol", async (req, res) => {
       adjusted = true,
     } = req.query;
 
-    let end = to || todayYMD();
-    let start = from || end;
+    let start, end;
 
-    let data = await makePolygonRequest(
+    if (from || to) {
+      // client pinned explicit dates
+      end = to || from;
+      start = from || end;
+    } else {
+      // find the most recent trading day
+      const { dateStr } = await findLastTradingDayNY(5);
+      start = end = dateStr;
+    }
+
+    const data = await makePolygonRequest(
       `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/${multiplier}/${timespan}/${start}/${end}`,
       { adjusted, sort, limit }
     );
-
-    if ((!data?.results?.length) && !from && !to) {
-      const prev = prevDayYMD();
-      data = await makePolygonRequest(
-        `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/${multiplier}/${timespan}/${prev}/${prev}`,
-        { adjusted, sort, limit }
-      );
-    }
 
     res.json({ results: Array.isArray(data?.results) ? data.results : [] });
   } catch (e) {
@@ -165,35 +174,23 @@ app.get("/ohlcv/:symbol", async (req, res) => {
   }
 });
 
-// Latest price: try latest minute bar (today NY), then previous day, then snapshot last trade
+// ----- Latest price (use last trading day minute bars, then snapshot fallback) -----
 app.get("/price/:symbol", async (req, res) => {
   const { symbol } = req.params;
   try {
     let price = null;
 
-    // 1) latest minute bar for today (NY)
-    const day = todayYMD();
+    // Try the latest minute bar from the most recent trading day
     try {
+      const { dateStr } = await findLastTradingDayNY(5);
       const aggs = await makePolygonRequest(
-        `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/minute/${day}/${day}`,
+        `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/minute/${dateStr}/${dateStr}`,
         { adjusted: true, sort: "desc", limit: 1 }
       );
       if (aggs?.results?.length) price = aggs.results[0].c;
     } catch (_) {}
 
-    // 2) previous day minute bar if still null
-    if (price == null) {
-      const prev = prevDayYMD();
-      try {
-        const aggsPrev = await makePolygonRequest(
-          `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/minute/${prev}/${prev}`,
-          { adjusted: true, sort: "desc", limit: 1 }
-        );
-        if (aggsPrev?.results?.length) price = aggsPrev.results[0].c;
-      } catch (_) {}
-    }
-
-    // 3) snapshot last trade fallback
+    // Snapshot last trade fallback (handles after-hours / entitlement cases)
     if (price == null) {
       const snap = await makePolygonRequest(
         `/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(symbol)}`
