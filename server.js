@@ -361,3 +361,87 @@ wss.on("connection", (wsClient) => {
 server.listen(PORT, () => {
   console.log(`✅ polygon-proxy listening on ${PORT}`);
 });
+
+
+// ----- Historical data (what the clean scanner calls) -----
+app.get("/historical/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const { days_back = 1, interval = "day" } = req.query;
+
+    // Find the last trading day (walk back a little extra)
+    const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
+
+    // Pull aggregates for that day (Polygon uses 'range/{multiplier}/{timespan}')
+    const data = await makePolygonRequest(
+      `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/${interval}/${dateStr}/${dateStr}`,
+      { adjusted: true, sort: "desc", limit: 100 }
+    );
+
+    // Shape to match clean scanner expectations
+    const results = (data?.results || []).map(bar => ({
+      c: bar.c,  // close
+      o: bar.o,  // open
+      h: bar.h,  // high
+      l: bar.l,  // low
+      v: bar.v,  // volume
+      t: bar.t   // timestamp (ms)
+    }));
+
+    res.json({ results });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to fetch historical data", message: String(e.message || e) });
+  }
+});
+
+
+
+// ----- Quote (what the clean scanner calls for current prices) -----
+app.get("/quote/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    let price = null;
+
+    // Try the latest minute bar from the most recent trading day
+    try {
+      const { dateStr } = await findLastTradingDayNY(5);
+      const aggs = await makePolygonRequest(
+        `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/minute/${dateStr}/${dateStr}`,
+        { adjusted: true, sort: "desc", limit: 1 }
+      );
+      if (aggs?.results?.length) price = aggs.results[0].c;
+    } catch (_) {}
+
+    // Snapshot fallback
+    if (price == null) {
+      const snap = await makePolygonRequest(
+        `/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(symbol)}`
+      );
+      price = snap?.ticker?.lastTrade?.p
+           ?? snap?.results?.lastTrade?.p
+           ?? snap?.lastTrade?.p
+           ?? null;
+    }
+
+    // Previous close for change calc (optional but provided for parity)
+    let prevClose = null;
+    try {
+      const prevData = await makePolygonRequest(
+        `/v2/aggs/ticker/${encodeURIComponent(symbol)}/prev`,
+        { adjusted: true }
+      );
+      prevClose = prevData?.results?.[0]?.c ?? null;
+    } catch (_) {}
+
+    // Format to what the clean scanner expects
+    res.json({
+      results: {
+        lastTrade: { p: price, s: 0 },
+        prevDay: { c: prevClose, o: prevClose, h: prevClose, l: prevClose, v: 0 }
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to fetch quote", message: String(e.message || e) });
+  }
+});
+
