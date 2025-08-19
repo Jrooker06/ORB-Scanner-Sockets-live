@@ -1,12 +1,25 @@
-// server.js — Polygon proxy (NY market–aware, weekend/holiday-proof)
-// Routes: /health, /gainers, /market/top-gainers, /symbol/:symbol,
-//         /ohlcv/:symbol, /price/:symbol, /previous_close/:symbol
-// Optional WS passthrough at /ws
+/**
+ * server.js — Polygon proxy (intraday snapshot gainers + REST + WS passthrough)
+ *
+ * Routes:
+ *   GET  /health
+ *   GET  /gainers                       -> Intraday top gainers (snapshot API) w/ grouped fallback
+ *   GET  /market/top-gainers            -> Alias of /gainers
+ *   GET  /symbol/:symbol                -> Polygon symbol snapshot passthrough
+ *   GET  /ohlcv/:symbol                 -> Aggregates with optional session filter (pre/rth/post/all)
+ *   GET  /price/:symbol                 -> Latest price (minute aggs -> snapshot fallback)
+ *   GET  /previous_close/:symbol        -> Previous close
+ *   GET  /historical/:symbol            -> Day/Minute historical (for scanners)
+ *   GET  /quote/:symbol                 -> Quote shape used by the clean scanner
+ *   WS   /ws                            -> Polygon WS passthrough
+ *
+ * Env:
+ *   POLYGON_API_KEY   (required)
+ *   PORT              (default 8080)
+ */
 
-// --- Env (dotenv optional for local dev; DO injects envs) ---
 try { require("dotenv").config(); } catch (_) {}
 
-// --- Deps ---
 const http = require("http");
 const express = require("express");
 const cors = require("cors");
@@ -14,7 +27,6 @@ const WebSocket = require("ws");
 
 // --- App setup ---
 const app = express();
-// You can tighten this with an allowlist later
 app.use(cors());
 app.use(express.json());
 
@@ -22,9 +34,9 @@ const PORT = process.env.PORT || 8080;
 const POLYGON_API_KEY = process.env.POLYGON_API_KEY;
 if (!POLYGON_API_KEY) throw new Error("POLYGON_API_KEY is not set");
 
-// Node 18+ has global fetch available
+// Node >=18 has global fetch
 
-// --- Helpers ---
+// --- Helpers ---------------------------------------------------------------
 async function makePolygonRequest(path, params = {}) {
   const base = "https://api.polygon.io";
   const qs = new URLSearchParams({ ...params, apiKey: POLYGON_API_KEY }).toString();
@@ -38,7 +50,7 @@ async function makePolygonRequest(path, params = {}) {
   return resp.json();
 }
 
-// ---------- Fundamentals (optional) ----------
+// ---------- Fundamentals (optional enrichment) ----------
 const FUND_CACHE = new Map();
 const TTL_MS = 24 * 60 * 60 * 1000;
 const now = () => Date.now();
@@ -75,8 +87,7 @@ async function getTickerOverview(ticker) {
   const data = await makePolygonRequest(`/v3/reference/tickers/${encodeURIComponent(ticker)}`);
   const r = data?.results || {};
   const out = {
-    // Polygon provides SIC description (industry), market cap, shares outstanding
-    sector: r.sic_description || null,      // "industry" text from SIC
+    sector: r.sic_description || null,
     sicCode: r.sic_code || null,
     marketCap: r.market_cap ?? null,
     weightedSharesOut: r.weighted_shares_outstanding ?? null,
@@ -100,7 +111,6 @@ function ymdNY(d = new Date()) {
   return `${y}-${m}-${da}`; // YYYY-MM-DD
 }
 function addDays(d, days) { return new Date(d.getTime() + days * 86400000); }
-function todayYMD() { return ymdNY(new Date()); }
 
 async function fetchGrouped(dateStr) {
   return await makePolygonRequest(`/v2/aggs/grouped/locale/us/market/stocks/${dateStr}`, {
@@ -122,27 +132,7 @@ async function findLastTradingDayNY(maxBack = 5) {
   return { dateStr: ymdNY(addDays(new Date(), -1)), grouped: { results: [] } };
 }
 
-// --- Routes ---
-
-// Health
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, status: "ok", message: "Server is running", timestamp: new Date().toISOString() });
-});
-
-// Full symbol snapshot
-app.get("/symbol/:symbol", async (req, res) => {
-  try {
-    const { symbol } = req.params;
-    const data = await makePolygonRequest(
-      `/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(symbol)}`
-    );
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: "Failed to fetch symbol snapshot", message: String(e.message || e) });
-  }
-});
-
-// ----- Gainers (computed from grouped aggregates) -----
+// ----- Previous-day gainers (fallback) -----
 async function computeGainers(limit = 50) {
   const { dateStr, grouped } = await findLastTradingDayNY(5);
   const rows = (grouped?.results || [])
@@ -161,15 +151,76 @@ async function computeGainers(limit = 50) {
     })
     .sort((a, b) => b.pctChange - a.pctChange)
     .slice(0, Math.min(limit, 200));
-  return { date: dateStr, results: rows };
+  return { date: dateStr, results: rows, source: "grouped" };
 }
 
+// ----- Intraday snapshot gainers (real-time-ish) -----
+async function computeSnapshotGainers(limit = 50) {
+  // Polygon snapshots: /v2/snapshot/locale/us/markets/stocks/gainers
+  const data = await makePolygonRequest(`/v2/snapshot/locale/us/markets/stocks/gainers`);
+
+  const rows = (data?.tickers || data?.results || [])
+    .map(r => {
+      // Support both "tickers" shape and older "results" shape
+      const tkr = r.ticker || r.T || r.symbol;
+      const last = r.lastTrade?.p ?? r.last?.price ?? r.lastQuote?.p ?? null;
+      const prev = r.prevDay?.c ?? r.prevClose ?? r.day?.o ?? null;
+      const todaysChange = r.todaysChange ?? (last != null && prev != null ? +(last - prev).toFixed(4) : null);
+      const todaysChangePerc = r.todaysChangePerc ?? (
+        last != null && prev ? +(((last - prev) / prev) * 100).toFixed(2) : null
+      );
+      const vol = r.day?.v ?? r.volume ?? null;
+
+      return {
+        ticker: tkr,
+        last,
+        previousClose: prev,
+        change: todaysChange,
+        pctChange: todaysChangePerc,
+        volume: vol,
+        raw: r
+      };
+    })
+    .filter(x => x.ticker && x.pctChange != null)
+    .sort((a, b) => (b.pctChange ?? -Infinity) - (a.pctChange ?? -Infinity))
+    .slice(0, Math.min(limit, 200));
+
+  return { date: new Date().toISOString(), results: rows, source: "snapshot" };
+}
+
+// --- Routes ----------------------------------------------------------------
+
+// Health
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, status: "ok", message: "Server is running", timestamp: new Date().toISOString() });
+});
+
+// Full symbol snapshot passthrough
+app.get("/symbol/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const data = await makePolygonRequest(
+      `/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(symbol)}`
+    );
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: "Failed to fetch symbol snapshot", message: String(e.message || e) });
+  }
+});
+
+// ----- Gainers (prefer intraday snapshots, fallback to grouped previous day) -----
 app.get("/gainers", async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || "50", 10);
     const includeFund = /fund|all/i.test(String(req.query.include||""));
 
-    const data = await computeGainers(limit);
+    let data;
+    try {
+      data = await computeSnapshotGainers(limit);   // intraday (live-ish)
+    } catch (_) {
+      data = await computeGainers(limit);           // fallback
+    }
+
     const rows = data.results;
 
     if (includeFund && rows.length) {
@@ -180,14 +231,13 @@ app.get("/gainers", async (req, res) => {
           sicCode: f.sicCode,
           marketCap: f.marketCap,
           sharesOutstanding: f.weightedSharesOut ?? f.shareClassSharesOut
-          // true "free float" not available from Polygon
         });
       });
     }
 
-    res.json({ date: data.date, results: rows });
+    res.json({ date: data.date, source: data.source, results: rows });
   } catch (e) {
-    res.status(500).json({ error: "Failed to compute gainers", message: String(e.message || e) });
+    res.status(500).json({ error: "Failed to fetch gainers", message: String(e.message || e) });
   }
 });
 
@@ -197,7 +247,13 @@ app.get("/market/top-gainers", async (req, res) => {
     const limit = parseInt(req.query.limit || "50", 10);
     const includeFund = /fund|all/i.test(String(req.query.include||""));
 
-    const data = await computeGainers(limit);
+    let data;
+    try {
+      data = await computeSnapshotGainers(limit);
+    } catch (_) {
+      data = await computeGainers(limit);
+    }
+
     const rows = data.results;
 
     if (includeFund && rows.length) {
@@ -212,9 +268,9 @@ app.get("/market/top-gainers", async (req, res) => {
       });
     }
 
-    res.json({ date: data.date, results: rows });
+    res.json({ date: data.date, source: data.source, results: rows });
   } catch (e) {
-    res.status(500).json({ error: "Failed to compute gainers", message: String(e.message || e) });
+    res.status(500).json({ error: "Failed to fetch gainers", message: String(e.message || e) });
   }
 });
 
@@ -236,11 +292,9 @@ app.get("/ohlcv/:symbol", async (req, res) => {
     let start, end;
 
     if (from || to) {
-      // client pinned explicit dates
       end = to || from;
       start = from || end;
     } else {
-      // find the most recent trading day
       const { dateStr } = await findLastTradingDayNY(5);
       start = end = dateStr;
     }
@@ -331,39 +385,7 @@ app.get("/previous_close/:symbol", async (req, res) => {
   }
 });
 
-// --- WebSocket passthrough (optional) ---
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ noServer: true });
-
-server.on("upgrade", (request, socket, head) => {
-  if (request.url === "/ws") {
-    wss.handleUpgrade(request, socket, head, wsClient => {
-      wss.emit("connection", wsClient, request);
-    });
-  } else {
-    socket.destroy();
-  }
-});
-
-wss.on("connection", (wsClient) => {
-  const upstream = new WebSocket("wss://socket.polygon.io/stocks");
-  upstream.on("open", () => {
-    upstream.send(JSON.stringify({ action: "auth", params: POLYGON_API_KEY }));
-  });
-  upstream.on("message", (msg) => { try { wsClient.send(msg.toString()); } catch {} });
-  wsClient.on("message", (msg) => { try { if (upstream.readyState === WebSocket.OPEN) upstream.send(msg.toString()); } catch {} });
-  const cleanup = () => { try { wsClient.close(); } catch {}; try { upstream.close(); } catch {}; };
-  wsClient.on("close", cleanup); wsClient.on("error", cleanup);
-  upstream.on("close", cleanup); upstream.on("error", cleanup);
-});
-
-// --- Start ---
-server.listen(PORT, () => {
-  console.log(`✅ polygon-proxy listening on ${PORT}`);
-});
-
-
-// ----- Historical data (what the clean scanner calls) -----
+// ----- Historical data (for scanners) -----
 app.get("/historical/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
@@ -394,9 +416,7 @@ app.get("/historical/:symbol", async (req, res) => {
   }
 });
 
-
-
-// ----- Quote (what the clean scanner calls for current prices) -----
+// ----- Quote (for the clean scanner) -----
 app.get("/quote/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
@@ -433,7 +453,6 @@ app.get("/quote/:symbol", async (req, res) => {
       prevClose = prevData?.results?.[0]?.c ?? null;
     } catch (_) {}
 
-    // Format to what the clean scanner expects
     res.json({
       results: {
         lastTrade: { p: price, s: 0 },
@@ -445,3 +464,35 @@ app.get("/quote/:symbol", async (req, res) => {
   }
 });
 
+// --- WebSocket passthrough (optional) --------------------------------------
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on("upgrade", (request, socket, head) => {
+  if (request.url === "/ws") {
+    wss.handleUpgrade(request, socket, head, wsClient => {
+      wss.emit("connection", wsClient, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+wss.on("connection", (wsClient) => {
+  const upstream = new WebSocket("wss://socket.polygon.io/stocks");
+  upstream.on("open", () => {
+    upstream.send(JSON.stringify({ action: "auth", params: POLYGON_API_KEY }));
+  });
+  upstream.on("message", (msg) => { try { wsClient.send(msg.toString()); } catch {} });
+  wsClient.on("message", (msg) => { try { if (upstream.readyState === WebSocket.OPEN) upstream.send(msg.toString()); } catch {} });
+  const cleanup = () => { try { wsClient.close(); } catch {}; try { upstream.close(); } catch {}; };
+  wsClient.on("close", cleanup); wsClient.on("error", cleanup);
+  upstream.on("close", cleanup); upstream.on("error", cleanup);
+});
+
+// --- Start -----------------------------------------------------------------
+server.listen(PORT, () => {
+  console.log(`✅ polygon-proxy listening on ${PORT}`);
+  console.log(`   GET  http://localhost:${PORT}/gainers`);
+  console.log(`   WS   ws://localhost:${PORT}/ws`);
+});
