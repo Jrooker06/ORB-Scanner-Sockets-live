@@ -491,8 +491,8 @@ wss.on("connection", (wsClient) => {
 });
 
 // --- Start -----------------------------------------------------------------
-server.listen(PORT, () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ polygon-proxy listening on ${PORT}`);
-  console.log(`   GET  http://localhost:${PORT}/gainers`);
-  console.log(`   WS   ws://localhost:${PORT}/ws`);
+  console.log(`   GET  http://0.0.0.0:${PORT}/gainers`);
+  console.log(`   WS   ws://0.0.0.0:${PORT}/ws`);
 });
