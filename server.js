@@ -531,3 +531,8 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`   GET  http://0.0.0.0:${PORT}/gainers`);
   console.log(`   WS   ws://0.0.0.0:${PORT}/ws`);
 });
+
+// API Health endpoint for scanner compatibility
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, status: "ok", message: "Server is running", timestamp: new Date().toISOString() });
+});
