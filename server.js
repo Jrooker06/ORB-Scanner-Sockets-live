@@ -3,6 +3,11 @@
  *
  * Routes:
  *   GET  /health
+ *   GET  /api/health                    -> Health check for scanner compatibility
+ *   GET  /api/gainers                   -> Top gainers for scanner (formatted)
+ *   GET  /api/float/:symbol             -> Float and sector data
+ *   GET  /api/historical/:symbol        -> Historical price data
+ *   GET  /api/news/:symbol              -> News data (placeholder)
  *   GET  /gainers                       -> Intraday top gainers (snapshot API) w/ grouped fallback
  *   GET  /market/top-gainers            -> Alias of /gainers
  *   GET  /symbol/:symbol                -> Polygon symbol snapshot passthrough
@@ -192,12 +197,88 @@ async function computeSnapshotGainers(limit = 50) {
 
 // Health
 app.get("/health", (_req, res) => {
-
-  // API Health endpoint for scanner compatibility
-  app.get("/api/health", (_req, res) => {
-    res.json({ ok: true, status: "ok", message: "Server is running", timestamp: new Date().toISOString() });
-  });
   res.json({ ok: true, status: "ok", message: "Server is running", timestamp: new Date().toISOString() });
+});
+
+// API Health endpoint for scanner compatibility
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, status: "ok", message: "Server is running", timestamp: new Date().toISOString() });
+});
+
+// ----- API endpoints for scanner compatibility -----
+app.get("/api/gainers", async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit || "50", 10);
+    let data;
+    try {
+      data = await computeSnapshotGainers(limit);   // intraday (live-ish)
+    } catch (_) {
+      data = await computeGainers(limit);           // fallback
+    }
+    
+    // Convert to the format expected by the scanner
+    const tickers = data.results.map(row => ({
+      ticker: row.ticker,
+      price: row.last || row.close,
+      change: row.change,
+      change_pct: row.pctChange,
+      volume: row.volume
+    }));
+    
+    res.json({ tickers });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/float/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const overview = await getTickerOverview(symbol);
+    res.json({ results: overview });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/historical/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const { days_back = 0, interval = "1" } = req.query;
+    
+    // Calculate date range
+    const end = new Date();
+    const start = new Date();
+    start.setDate(start.getDate() - parseInt(days_back));
+    
+    const data = await makePolygonRequest(
+      `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/${interval}/minute/${start.toISOString().split('T')[0]}/${end.toISOString().split('T')[0]}`,
+      { adjusted: true, sort: "asc", limit: 5000 }
+    );
+    
+    const results = (data?.results || []).map(bar => ({
+      t: bar.t,  // timestamp
+      o: bar.o,  // open
+      h: bar.h,  // high
+      l: bar.l,  // low
+      c: bar.c,  // close
+      v: bar.v,  // volume
+      n: bar.n   // transactions
+    }));
+    
+    res.json({ results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/news/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    res.json({ results: [] }); // Placeholder for news endpoint
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Full symbol snapshot passthrough
@@ -215,36 +296,6 @@ app.get("/symbol/:symbol", async (req, res) => {
 
 // ----- Gainers (prefer intraday snapshots, fallback to grouped previous day) -----
 app.get("/gainers", async (req, res) => {
-
-  // API endpoints for scanner compatibility
-  app.get("/api/gainers", async (req, res) => {
-    try {
-      const limit = parseInt(req.query.limit || "50", 10);
-      const gainers = await getTopGainers(limit);
-      res.json({ tickers: gainers });
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  app.get("/api/float/:symbol", async (req, res) => {
-    try {
-      const { symbol } = req.params;
-      const overview = await getTickerOverview(symbol);
-      res.json({ results: overview });
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  app.get("/api/news/:symbol", async (req, res) => {
-    try {
-      const { symbol } = req.params;
-      res.json({ results: [] }); // Placeholder for news endpoint
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
   try {
     const limit = parseInt(req.query.limit || "50", 10);
     const includeFund = /fund|all/i.test(String(req.query.include||""));
@@ -529,10 +580,6 @@ wss.on("connection", (wsClient) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ polygon-proxy listening on ${PORT}`);
   console.log(`   GET  http://0.0.0.0:${PORT}/gainers`);
+  console.log(`   GET  http://0.0.0.0:${PORT}/api/gainers`);
   console.log(`   WS   ws://0.0.0.0:${PORT}/ws`);
-});
-
-// API Health endpoint for scanner compatibility
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, status: "ok", message: "Server is running", timestamp: new Date().toISOString() });
 });
