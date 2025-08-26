@@ -39,6 +39,31 @@ const PORT = process.env.PORT || 8080;
 const POLYGON_API_KEY = process.env.POLYGON_API_KEY;
 if (!POLYGON_API_KEY) throw new Error("POLYGON_API_KEY is not set");
 
+// License key authentication middleware
+const VALID_LICENSE_KEYS = [
+  "test-license-123",  // Default test key from scanner
+  process.env.LICENSE_KEY  // Environment variable for production
+].filter(Boolean);
+
+function authenticateLicense(req, res, next) {
+  const licenseKey = req.headers['x-license-key'];
+  
+  console.log(`🔐 License auth check for ${req.method} ${req.path} - Key: ${licenseKey ? 'Present' : 'Missing'}`);
+  
+  if (!licenseKey) {
+    console.log(`❌ License key missing for ${req.path}`);
+    return res.status(401).json({ error: "License key required" });
+  }
+  
+  if (!VALID_LICENSE_KEYS.includes(licenseKey)) {
+    console.log(`❌ Invalid license key for ${req.path}: ${licenseKey}`);
+    return res.status(403).json({ error: "Invalid license key" });
+  }
+  
+  console.log(`✅ License key valid for ${req.path}`);
+  next();
+}
+
 // Node >=18 has global fetch
 
 // --- Helpers ---------------------------------------------------------------
@@ -205,15 +230,35 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true, status: "ok", message: "Server is running", timestamp: new Date().toISOString() });
 });
 
+// Test endpoint to verify server is working (no auth required)
+app.get("/api/test", (_req, res) => {
+  res.json({ 
+    ok: true, 
+    message: "Server is working! Test the authenticated endpoints with X-License-Key header",
+    endpoints: [
+      "/api/gainers - Top gainers (requires X-License-Key)",
+      "/api/float/:symbol - Float/sector data (requires X-License-Key)",
+      "/api/historical/:symbol - Historical data (requires X-License-Key)",
+      "/api/price/:symbol - Live price (requires X-License-Key)"
+    ],
+    timestamp: new Date().toISOString() 
+  });
+});
+
 // ----- API endpoints for scanner compatibility -----
-app.get("/api/gainers", async (req, res) => {
+app.get("/api/gainers", authenticateLicense, async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit || "50", 10);
+    const limit = parseInt(req.query.limit || "200", 10);  // Increased default from 50 to 200
+    console.log(`🔍 /api/gainers called with limit: ${limit}`);
+    
     let data;
     try {
       data = await computeSnapshotGainers(limit);   // intraday (live-ish)
-    } catch (_) {
+      console.log(`✅ Snapshot gainers fetched: ${data.results?.length || 0} symbols`);
+    } catch (error) {
+      console.log(`⚠️ Snapshot gainers failed, using fallback: ${error.message}`);
       data = await computeGainers(limit);           // fallback
+      console.log(`✅ Fallback gainers fetched: ${data.results?.length || 0} symbols`);
     }
     
     // Convert to the format expected by the scanner
@@ -225,13 +270,17 @@ app.get("/api/gainers", async (req, res) => {
       volume: row.volume
     }));
     
+    console.log(`📊 Returning ${tickers.length} tickers to scanner`);
+    console.log(`📈 Top 5 gainers: ${tickers.slice(0, 5).map(t => `${t.ticker}: ${t.change_pct}%`).join(', ')}`);
+    
     res.json({ tickers });
   } catch (error) {
+    console.error(`❌ /api/gainers error: ${error.message}`);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.get("/api/float/:symbol", async (req, res) => {
+app.get("/api/float/:symbol", authenticateLicense, async (req, res) => {
   try {
     const { symbol } = req.params;
     const overview = await getTickerOverview(symbol);
@@ -241,7 +290,7 @@ app.get("/api/float/:symbol", async (req, res) => {
   }
 });
 
-app.get("/api/historical/:symbol", async (req, res) => {
+app.get("/api/historical/:symbol", authenticateLicense, async (req, res) => {
   try {
     const { symbol } = req.params;
     const { days_back = 0, interval = "1" } = req.query;
@@ -272,7 +321,7 @@ app.get("/api/historical/:symbol", async (req, res) => {
   }
 });
 
-app.get("/api/news/:symbol", async (req, res) => {
+app.get("/api/news/:symbol", authenticateLicense, async (req, res) => {
   try {
     const { symbol } = req.params;
     res.json({ results: [] }); // Placeholder for news endpoint
@@ -284,7 +333,7 @@ app.get("/api/news/:symbol", async (req, res) => {
 // ----- Additional Scanner Endpoints -----
 
 // Real-time price updates for live monitoring
-app.get("/api/price/:symbol", async (req, res) => {
+app.get("/api/price/:symbol", authenticateLicense, async (req, res) => {
   try {
     const { symbol } = req.params;
     const data = await makePolygonRequest(
