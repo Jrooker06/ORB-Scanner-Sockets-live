@@ -490,13 +490,29 @@ app.get("/api/ema9/:symbol", async (req, res) => {
     const { symbol } = req.params;
     const { days_back = 30 } = req.query;
     
-    const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
-    const data = await makePolygonRequest(
-      `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
-      { adjusted: true, sort: "desc", limit: parseInt(days_back) }
-    );
+    // Try daily data first
+    let prices = [];
+    try {
+      const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
+      const data = await makePolygonRequest(
+        `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
+        { adjusted: true, sort: "desc", limit: parseInt(days_back) }
+      );
+      prices = (data?.results || []).map(bar => bar.c).reverse();
+    } catch (_) {}
     
-    const prices = (data?.results || []).map(bar => bar.c).reverse();
+    // If daily data insufficient, try minute data for today
+    if (prices.length < 9) {
+      try {
+        const today = new Date().toISOString().split('T')[0];
+        const data = await makePolygonRequest(
+          `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/minute/${today}/${today}`,
+          { adjusted: true, sort: "asc", limit: 1000 }
+        );
+        prices = (data?.results || []).map(bar => bar.c);
+      } catch (_) {}
+    }
+    
     if (prices.length < 9) {
       return res.json({ error: "Insufficient data for EMA9 calculation (need at least 9 data points)" });
     }
@@ -509,7 +525,8 @@ app.get("/api/ema9/:symbol", async (req, res) => {
       period: 9,
       data_points: prices.length,
       current_price: prices[prices.length - 1],
-      above_ema9: prices[prices.length - 1] > ema9
+      above_ema9: prices[prices.length - 1] > ema9,
+      data_source: prices.length > 100 ? "minute" : "daily"
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -522,13 +539,29 @@ app.get("/api/ema21/:symbol", async (req, res) => {
     const { symbol } = req.params;
     const { days_back = 60 } = req.query;
     
-    const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
-    const data = await makePolygonRequest(
-      `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
-      { adjusted: true, sort: "desc", limit: parseInt(days_back) }
-    );
+    // Try daily data first
+    let prices = [];
+    try {
+      const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
+      const data = await makePolygonRequest(
+        `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
+        { adjusted: true, sort: "desc", limit: parseInt(days_back) }
+      );
+      prices = (data?.results || []).map(bar => bar.c).reverse();
+    } catch (_) {}
     
-    const prices = (data?.results || []).map(bar => bar.c).reverse();
+    // If daily data insufficient, try minute data for today
+    if (prices.length < 21) {
+      try {
+        const today = new Date().toISOString().split('T')[0];
+        const data = await makePolygonRequest(
+          `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/minute/${today}/${today}`,
+          { adjusted: true, sort: "asc", limit: 1000 }
+        );
+        prices = (data?.results || []).map(bar => bar.c);
+      } catch (_) {}
+    }
+    
     if (prices.length < 21) {
       return res.json({ error: "Insufficient data for EMA21 calculation (need at least 21 data points)" });
     }
@@ -541,7 +574,8 @@ app.get("/api/ema21/:symbol", async (req, res) => {
       period: 21,
       data_points: prices.length,
       current_price: prices[prices.length - 1],
-      above_ema21: prices[prices.length - 1] > ema21
+      above_ema21: prices[prices.length - 1] > ema21,
+      data_source: prices.length > 100 ? "minute" : "daily"
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -554,13 +588,29 @@ app.get("/api/ema-trend/:symbol", async (req, res) => {
     const { symbol } = req.params;
     const { days_back = 60 } = req.query;
     
-    const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
-    const data = await makePolygonRequest(
-      `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
-      { adjusted: true, sort: "desc", limit: parseInt(days_back) }
-    );
+    // Try daily data first
+    let prices = [];
+    try {
+      const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
+      const data = await makePolygonRequest(
+        `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
+        { adjusted: true, sort: "desc", limit: parseInt(days_back) }
+      );
+      prices = (data?.results || []).map(bar => bar.c).reverse();
+    } catch (_) {}
     
-    const prices = (data?.results || []).map(bar => bar.c).reverse();
+    // If daily data insufficient, try minute data for today
+    if (prices.length < 21) {
+      try {
+        const today = new Date().toISOString().split('T')[0];
+        const data = await makePolygonRequest(
+          `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/minute/${today}/${today}`,
+          { adjusted: true, sort: "asc", limit: 1000 }
+        );
+        prices = (data?.results || []).map(bar => bar.c);
+      } catch (_) {}
+    }
+    
     if (prices.length < 21) {
       return res.json({ error: "Insufficient data for EMA calculations (need at least 21 data points)" });
     }
@@ -600,7 +650,8 @@ app.get("/api/ema-trend/:symbol", async (req, res) => {
       above_ema9: currentPrice > ema9,
       above_ema21: currentPrice > ema21,
       ema9_above_ema21: ema9 > ema21,
-      data_points: prices.length
+      data_points: prices.length,
+      data_source: prices.length > 100 ? "minute" : "daily"
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
