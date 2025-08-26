@@ -281,6 +281,454 @@ app.get("/api/news/:symbol", async (req, res) => {
   }
 });
 
+// ----- Additional Scanner Endpoints -----
+
+// Real-time price updates for live monitoring
+app.get("/api/price/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const data = await makePolygonRequest(
+      `/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(symbol)}`
+    );
+    
+    const price = data?.ticker?.lastTrade?.p ?? data?.results?.lastTrade?.p ?? null;
+    const volume = data?.ticker?.day?.v ?? data?.results?.day?.v ?? null;
+    const change = data?.ticker?.todaysChange ?? data?.results?.todaysChange ?? null;
+    const changePct = data?.ticker?.todaysChangePerc ?? data?.results?.todaysChangePerc ?? null;
+    
+    res.json({
+      symbol,
+      price,
+      volume,
+      change,
+      change_pct: changePct,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Volume analysis for volume-based scanning
+app.get("/api/volume/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const { days_back = 1 } = req.query;
+    
+    const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
+    const data = await makePolygonRequest(
+      `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/minute/${dateStr}/${dateStr}`,
+      { adjusted: true, sort: "desc", limit: 1000 }
+    );
+    
+    const results = (data?.results || []).map(bar => ({
+      timestamp: bar.t,
+      volume: bar.v,
+      price: bar.c
+    }));
+    
+    res.json({ results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Market status and session info for timing decisions
+app.get("/api/market/status", async (req, res) => {
+  try {
+    const now = new Date();
+    const nyTime = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
+    const hour = nyTime.getHours();
+    const minute = nyTime.getMinutes();
+    
+    let session = "closed";
+    if (hour >= 9 && hour < 16) session = "regular";
+    else if (hour >= 4 && hour < 9) session = "premarket";
+    else if (hour >= 16 && hour < 20) session = "afterhours";
+    
+    res.json({
+      session,
+      time: nyTime.toISOString(),
+      is_market_open: session === "regular",
+      next_open: "09:30",
+      next_close: "16:00"
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// RSI calculation for technical analysis
+app.get("/api/rsi/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const { period = 14, days_back = 30 } = req.query;
+    
+    const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
+    const data = await makePolygonRequest(
+      `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
+      { adjusted: true, sort: "desc", limit: period + 10 }
+    );
+    
+    // Calculate RSI
+    const prices = (data?.results || []).map(bar => bar.c).reverse();
+    const rsi = calculateRSI(prices, parseInt(period));
+    
+    res.json({ rsi, period, symbol });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// VWAP calculation for price analysis
+app.get("/api/vwap/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const { days_back = 1 } = req.query;
+    
+    const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
+    const data = await makePolygonRequest(
+      `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/minute/${dateStr}/${dateStr}`,
+      { adjusted: true, sort: "asc", limit: 1000 }
+    );
+    
+    const results = data?.results || [];
+    if (results.length === 0) {
+      return res.json({ vwap: null, symbol });
+    }
+    
+    // Calculate VWAP
+    let totalVolume = 0;
+    let totalVolumePrice = 0;
+    
+    results.forEach(bar => {
+      const typicalPrice = (bar.h + bar.l + bar.c) / 3;
+      totalVolumePrice += typicalPrice * bar.v;
+      totalVolume += bar.v;
+    });
+    
+    const vwap = totalVolume > 0 ? totalVolumePrice / totalVolume : null;
+    
+    res.json({ 
+      vwap: vwap ? parseFloat(vwap.toFixed(4)) : null, 
+      symbol,
+      data_points: results.length 
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// MACD calculation for trend analysis
+app.get("/api/macd/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const { fast = 12, slow = 26, signal = 9, days_back = 60 } = req.query;
+    
+    const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
+    const data = await makePolygonRequest(
+      `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
+      { adjusted: true, sort: "desc", limit: Math.max(fast, slow, signal) + 20 }
+    );
+    
+    const prices = (data?.results || []).map(bar => bar.c).reverse();
+    if (prices.length < Math.max(fast, slow, signal)) {
+      return res.json({ error: "Insufficient data for MACD calculation" });
+    }
+    
+    const macd = calculateMACD(prices, parseInt(fast), parseInt(slow), parseInt(signal));
+    
+    res.json({ 
+      macd, 
+      symbol, 
+      fast_period: parseInt(fast), 
+      slow_period: parseInt(slow), 
+      signal_period: parseInt(signal) 
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Support and Resistance levels
+app.get("/api/support-resistance/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const { days_back = 30 } = req.query;
+    
+    const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
+    const data = await makePolygonRequest(
+      `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
+      { adjusted: true, sort: "desc", limit: parseInt(days_back) }
+    );
+    
+    const prices = (data?.results || []).map(bar => bar.h);
+    const lows = (data?.results || []).map(bar => bar.l);
+    
+    if (prices.length === 0) {
+      return res.json({ support: null, resistance: null, symbol });
+    }
+    
+    // Simple support and resistance calculation
+    const resistance = Math.max(...prices);
+    const support = Math.min(...lows);
+    
+    res.json({ 
+      support: parseFloat(support.toFixed(4)), 
+      resistance: parseFloat(resistance.toFixed(4)), 
+      symbol,
+      data_points: prices.length 
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// EMA9 calculation for short-term trend
+app.get("/api/ema9/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const { days_back = 30 } = req.query;
+    
+    const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
+    const data = await makePolygonRequest(
+      `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
+      { adjusted: true, sort: "desc", limit: parseInt(days_back) }
+    );
+    
+    const prices = (data?.results || []).map(bar => bar.c).reverse();
+    if (prices.length < 9) {
+      return res.json({ error: "Insufficient data for EMA9 calculation (need at least 9 data points)" });
+    }
+    
+    const ema9 = calculateEMA(prices, 9);
+    
+    res.json({ 
+      ema9: parseFloat(ema9.toFixed(4)), 
+      symbol,
+      period: 9,
+      data_points: prices.length,
+      current_price: prices[prices.length - 1],
+      above_ema9: prices[prices.length - 1] > ema9
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// EMA21 calculation for medium-term trend
+app.get("/api/ema21/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const { days_back = 60 } = req.query;
+    
+    const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
+    const data = await makePolygonRequest(
+      `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
+      { adjusted: true, sort: "desc", limit: parseInt(days_back) }
+    );
+    
+    const prices = (data?.results || []).map(bar => bar.c).reverse();
+    if (prices.length < 21) {
+      return res.json({ error: "Insufficient data for EMA21 calculation (need at least 21 data points)" });
+    }
+    
+    const ema21 = calculateEMA(prices, 21);
+    
+    res.json({ 
+      ema21: parseFloat(ema21.toFixed(4)), 
+      symbol,
+      period: 21,
+      data_points: prices.length,
+      current_price: prices[prices.length - 1],
+      above_ema21: prices[prices.length - 1] > ema21
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Combined EMA9 and EMA21 for trend analysis
+app.get("/api/ema-trend/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const { days_back = 60 } = req.query;
+    
+    const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
+    const data = await makePolygonRequest(
+      `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
+      { adjusted: true, sort: "desc", limit: parseInt(days_back) }
+    );
+    
+    const prices = (data?.results || []).map(bar => bar.c).reverse();
+    if (prices.length < 21) {
+      return res.json({ error: "Insufficient data for EMA calculations (need at least 21 data points)" });
+    }
+    
+    const ema9 = calculateEMA(prices, 9);
+    const ema21 = calculateEMA(prices, 21);
+    const currentPrice = prices[prices.length - 1];
+    
+    // Determine trend
+    let trend = "neutral";
+    if (ema9 > ema21 && currentPrice > ema9) {
+      trend = "bullish";
+    } else if (ema9 < ema21 && currentPrice < ema9) {
+      trend = "bearish";
+    }
+    
+    // Check for golden/death cross
+    let cross_signal = "none";
+    if (prices.length >= 22) {
+      const prevEma9 = calculateEMA(prices.slice(0, -1), 9);
+      const prevEma21 = calculateEMA(prices.slice(0, -1), 21);
+      
+      if (ema9 > ema21 && prevEma9 <= prevEma21) {
+        cross_signal = "golden_cross"; // EMA9 crossed above EMA21
+      } else if (ema9 < ema21 && prevEma9 >= prevEma21) {
+        cross_signal = "death_cross"; // EMA9 crossed below EMA21
+      }
+    }
+    
+    res.json({ 
+      symbol,
+      ema9: parseFloat(ema9.toFixed(4)),
+      ema21: parseFloat(ema21.toFixed(4)),
+      current_price: parseFloat(currentPrice.toFixed(4)),
+      trend,
+      cross_signal,
+      above_ema9: currentPrice > ema9,
+      above_ema21: currentPrice > ema21,
+      ema9_above_ema21: ema9 > ema21,
+      data_points: prices.length
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// EMA crossover alerts for trading signals
+app.get("/api/ema-crossover/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const { days_back = 30 } = req.query;
+    
+    const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
+    const data = await makePolygonRequest(
+      `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
+      { adjusted: true, sort: "desc", limit: parseInt(days_back) }
+    );
+    
+    const prices = (data?.results || []).map(bar => bar.c).reverse();
+    if (prices.length < 21) {
+      return res.json({ error: "Insufficient data for crossover analysis" });
+    }
+    
+    // Calculate EMAs for multiple periods to detect crossovers
+    const emaValues = [];
+    for (let i = 9; i < prices.length; i++) {
+      const ema9 = calculateEMA(prices.slice(0, i + 1), 9);
+      const ema21 = calculateEMA(prices.slice(0, i + 1), 21);
+      emaValues.push({
+        date: i,
+        ema9: parseFloat(ema9.toFixed(4)),
+        ema21: parseFloat(ema21.toFixed(4)),
+        crossover: ema9 > ema21
+      });
+    }
+    
+    // Find recent crossovers
+    const crossovers = [];
+    for (let i = 1; i < emaValues.length; i++) {
+      const prev = emaValues[i - 1];
+      const curr = emaValues[i];
+      
+      if (prev.crossover !== curr.crossover) {
+        crossovers.push({
+          date_index: curr.date,
+          type: curr.crossover ? "golden_cross" : "death_cross",
+          ema9: curr.ema9,
+          ema21: curr.ema21,
+          price_at_crossover: prices[curr.date]
+        });
+      }
+    }
+    
+    res.json({ 
+      symbol,
+      current_ema9: emaValues[emaValues.length - 1].ema9,
+      current_ema21: emaValues[emaValues.length - 1].ema21,
+      current_price: prices[prices.length - 1],
+      trend: emaValues[emaValues.length - 1].crossover ? "bullish" : "bearish",
+      recent_crossovers: crossovers.slice(-3), // Last 3 crossovers
+      total_crossovers: crossovers.length,
+      data_points: prices.length
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Helper function for RSI calculation
+function calculateRSI(prices, period) {
+  if (prices.length < period + 1) return null;
+  
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const change = prices[i] - prices[i-1];
+    if (change > 0) gains += change;
+    else losses -= change;
+  }
+  
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
+}
+
+// Helper function for MACD calculation
+function calculateMACD(prices, fastPeriod, slowPeriod, signalPeriod) {
+  if (prices.length < Math.max(fastPeriod, slowPeriod, signalPeriod)) return null;
+  
+  // Calculate EMAs
+  const fastEMA = calculateEMA(prices, fastPeriod);
+  const slowEMA = calculateEMA(prices, slowPeriod);
+  
+  // Calculate MACD line
+  const macdLine = fastEMA - slowEMA;
+  
+  // Calculate signal line (EMA of MACD line)
+  const macdValues = [];
+  for (let i = 0; i < prices.length; i++) {
+    const fastEMA_i = calculateEMA(prices.slice(0, i + 1), fastPeriod);
+    const slowEMA_i = calculateEMA(prices.slice(0, i + 1), slowPeriod);
+    macdValues.push(fastEMA_i - slowEMA_i);
+  }
+  
+  const signalLine = calculateEMA(macdValues, signalPeriod);
+  const histogram = macdLine - signalLine;
+  
+  return {
+    macd_line: parseFloat(macdLine.toFixed(4)),
+    signal_line: parseFloat(signalLine.toFixed(4)),
+    histogram: parseFloat(histogram.toFixed(4))
+  };
+}
+
+// Helper function for EMA calculation
+function calculateEMA(prices, period) {
+  if (prices.length === 0) return 0;
+  
+  const multiplier = 2 / (period + 1);
+  let ema = prices[0];
+  
+  for (let i = 1; i < prices.length; i++) {
+    ema = (prices[i] * multiplier) + (ema * (1 - multiplier));
+  }
+  
+  return ema;
+}
+
 // Full symbol snapshot passthrough
 app.get("/symbol/:symbol", async (req, res) => {
   try {
