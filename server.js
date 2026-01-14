@@ -8,6 +8,9 @@
  *   GET  /api/float/:symbol             -> Float and sector data
  *   GET  /api/historical/:symbol        -> Historical price data
  *   GET  /api/news/:symbol              -> News data (placeholder)
+ *   GET  /api/shared-tickers            -> Get all shared tickers (clears at 6 PM EST)
+ *   POST /api/shared-tickers            -> Add a shared ticker (developer mode only)
+ *   DELETE /api/shared-tickers/:symbol  -> Remove a shared ticker
  *   GET  /gainers                       -> Intraday top gainers (snapshot API) w/ grouped fallback
  *   GET  /market/top-gainers            -> Alias of /gainers
  *   GET  /symbol/:symbol                -> Polygon symbol snapshot passthrough
@@ -1046,6 +1049,91 @@ app.get("/quote/:symbol", async (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ error: "Failed to fetch quote", message: String(e.message || e) });
+  }
+});
+
+// --- Shared Tickers (daily ticker sharing) ---
+const sharedTickers = new Map(); // symbol -> {symbol, addedAt, addedBy}
+let currentTradingDay = ymdNY();
+
+// Helper to check if we're past trading day end (6:00 PM ET)
+function getNYTime() {
+  const now = new Date();
+  return new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+}
+
+function isAfterMarketClose() {
+  const nyTime = getNYTime();
+  const hour = nyTime.getHours();
+  return hour >= 18; // 6:00 PM ET (18:00)
+}
+
+// Clear shared tickers at end of trading day
+function checkTradingDayReset() {
+  const today = ymdNY();
+  if (today !== currentTradingDay || isAfterMarketClose()) {
+    sharedTickers.clear();
+    currentTradingDay = today;
+    console.log(`📅 Cleared shared tickers for new trading day: ${today}`);
+  }
+}
+
+// Helper to check if user is in developer mode
+function isDeveloperMode(req) {
+  const userEmail = req.headers['x-user-email'] || '';
+  return userEmail.trim().toLowerCase() === 'admin@example.com';
+}
+
+// GET /api/shared-tickers - Get all shared tickers
+app.get("/api/shared-tickers", (req, res) => {
+  try {
+    checkTradingDayReset();
+    const tickers = Array.from(sharedTickers.values());
+    res.json({ success: true, tickers });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to fetch shared tickers", message: String(e.message || e) });
+  }
+});
+
+// POST /api/shared-tickers - Add a shared ticker (developer mode only)
+app.post("/api/shared-tickers", (req, res) => {
+  try {
+    checkTradingDayReset();
+    
+    // Check if user is in developer mode
+    if (!isDeveloperMode(req)) {
+      return res.status(403).json({ error: "Only developer mode can add shared tickers" });
+    }
+    
+    const { symbol } = req.body;
+    if (!symbol) {
+      return res.status(400).json({ error: "Symbol is required" });
+    }
+    const ticker = symbol.toUpperCase().trim();
+    sharedTickers.set(ticker, {
+      symbol: ticker,
+      addedAt: new Date().toISOString(),
+      addedBy: req.headers['x-user-email'] || 'unknown'
+    });
+    res.json({ success: true, ticker: sharedTickers.get(ticker) });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to add shared ticker", message: String(e.message || e) });
+  }
+});
+
+// DELETE /api/shared-tickers/:symbol - Remove a shared ticker
+app.delete("/api/shared-tickers/:symbol", (req, res) => {
+  try {
+    checkTradingDayReset();
+    const { symbol } = req.params;
+    const ticker = symbol.toUpperCase().trim();
+    if (sharedTickers.delete(ticker)) {
+      res.json({ success: true, message: `Removed ${ticker}` });
+    } else {
+      res.status(404).json({ error: "Ticker not found" });
+    }
+  } catch (e) {
+    res.status(500).json({ error: "Failed to remove shared ticker", message: String(e.message || e) });
   }
 });
 
