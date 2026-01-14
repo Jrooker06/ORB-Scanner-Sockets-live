@@ -1081,7 +1081,8 @@ function checkTradingDayReset() {
 // Helper to check if user is in developer mode
 function isDeveloperMode(req) {
   const userEmail = req.headers['x-user-email'] || '';
-  return userEmail.trim().toLowerCase() === 'admin@example.com';
+  const email = userEmail.trim().toLowerCase();
+  return email === 'admin@example.com' || email === 'admin2@example.com';
 }
 
 // GET /api/shared-tickers - Get all shared tickers
