@@ -3,11 +3,12 @@
  *
  * Routes:
  *   GET  /health
+ *   GET  /api                            -> Route manifest + version (no token)
  *   GET  /api/health                    -> Health check for scanner compatibility
  *   GET  /api/gainers                   -> Top gainers for scanner (formatted)
- *   GET  /api/float/:symbol             -> Float and sector data
+ *   GET  /api/float/:symbol             -> Free float (Massive); fallback Polygon ticker overview
  *   GET  /api/historical/:symbol        -> Historical price data
- *   GET  /api/news/:symbol              -> News data (placeholder)
+ *   GET  /api/news/:symbol              -> News via Massive (?source=benzinga|stocks, ?limit=N)
  *   GET  /api/shared-tickers            -> Get all shared tickers (clears at 6 PM EST)
  *   POST /api/shared-tickers            -> Add a shared ticker (developer mode only)
  *   DELETE /api/shared-tickers/:symbol  -> Remove a shared ticker
@@ -22,8 +23,18 @@
  *   WS   /ws                            -> Polygon WS passthrough
  *
  * Env:
- *   POLYGON_API_KEY   (required)
- *   PORT              (default 8080)
+ *   POLYGON_API_KEY           (required)
+ *   MASSIVE_API_BASE_URL      (optional) Massive REST base; default https://api.massive.com
+ *   MASSIVE_API_KEY           (optional) Massive key; default POLYGON_API_KEY
+ *   NEWS_CACHE_BENZINGA_SEC   (optional) News cache TTL seconds for Benzinga; default 30
+ *   NEWS_CACHE_STOCKS_SEC     (optional) News cache TTL seconds for Stocks news; default 180
+ *   NEWS_RATE_LIMIT_PER_MIN   (optional) Max /api/news requests per IP per minute; default 60
+ *   NEWS_RATE_MAP_MAX         (optional) Max IP entries in news rate map; default 10000 (prune when over)
+ *   FUND_CACHE_MAX           (optional) Max entries in fundamentals cache; default 5000
+ *   NEWS_CACHE_MAX           (optional) Max entries in news cache; default 2000
+ *   TRUST_PROXY              (optional) Set to 1 or true when behind nginx/load balancer so req.ip is correct
+ *   SHUTDOWN_GRACE_MS        (optional) Grace period before force-exit on SIGTERM/SIGINT; default 10000
+ *   PORT                     (default 8080)
  */
 
 try { require("dotenv").config(); } catch (_) {}
@@ -35,12 +46,89 @@ const WebSocket = require("ws");
 
 // --- App setup ---
 const app = express();
+if (process.env.TRUST_PROXY === "1" || process.env.TRUST_PROXY === "true") {
+  app.set("trust proxy", 1);
+}
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 const POLYGON_API_KEY = process.env.POLYGON_API_KEY;
 if (!POLYGON_API_KEY) throw new Error("POLYGON_API_KEY is not set");
+// Massive — Float + News (Benzinga / Stocks). Default native Massive host; set MASSIVE_API_BASE_URL for Polygon-hosted.
+const MASSIVE_API_BASE = (process.env.MASSIVE_API_BASE_URL || "https://api.massive.com").replace(/\/$/, "");
+const MASSIVE_API_KEY = process.env.MASSIVE_API_KEY || POLYGON_API_KEY;
+
+// --- Security middleware ---
+// App token middleware for stock endpoints (protects Polygon quota)
+const APP_TOKEN = process.env.APP_TOKEN;
+const isProduction = process.env.NODE_ENV === "production";
+if (isProduction && !APP_TOKEN) {
+  throw new Error("APP_TOKEN is required in production. Set APP_TOKEN in env.");
+}
+function requireAppToken(req, res, next) {
+  if (req.path === "/api/health" || req.path === "/health" || req.path === "/api") return next();
+  if (!APP_TOKEN) return next();
+  const token = req.headers["x-app-token"];
+  if (token !== APP_TOKEN) {
+    return res.status(401).json({ error: "Unauthorized", message: "Missing or invalid x-app-token header" });
+  }
+  next();
+}
+
+app.use(requireAppToken);
+
+// Request logging: method, path, status, duration (no bodies/tokens)
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    console.log(`${req.method} ${req.path} ${res.statusCode} ${Date.now() - start}ms`);
+  });
+  next();
+});
+
+// Ticker validation: 1–10 uppercase letters or BRK.B-style (e.g. BRK.B)
+const TICKER_REGEX = /^[A-Z]{1,10}$|^[A-Z]{1,5}\.[A-Z]{1,4}$/;
+function validTicker(s) {
+  const t = String(s || "").toUpperCase();
+  return t.length >= 1 && t.length <= 12 && TICKER_REGEX.test(t);
+}
+
+// Validate :symbol on all routes that use it (returns 400 if invalid)
+app.param("symbol", (req, res, next, symbol) => {
+  const t = String(symbol || "").toUpperCase();
+  if (!validTicker(t)) {
+    return res.status(400).json({ error: "Invalid symbol", symbol: t });
+  }
+  next();
+});
+
+// In-memory rate limit for /api/news (per IP). Prune stale entries when over cap.
+const NEWS_RATE_WINDOW_MS = 60 * 1000;
+const NEWS_RATE_MAX = parseInt(process.env.NEWS_RATE_LIMIT_PER_MIN, 10) || 60;
+const NEWS_RATE_MAP_MAX = parseInt(process.env.NEWS_RATE_MAP_MAX, 10) || 10000;
+const newsRateMap = new Map();
+function checkNewsRateLimit(ip) {
+  const n = Date.now();
+  if (newsRateMap.size > NEWS_RATE_MAP_MAX) {
+    for (const [k, rec] of newsRateMap.entries()) {
+      if (n - rec.since > NEWS_RATE_WINDOW_MS) newsRateMap.delete(k);
+    }
+  }
+  let rec = newsRateMap.get(ip);
+  if (!rec) {
+    newsRateMap.set(ip, { count: 1, since: n });
+    return true;
+  }
+  if (n - rec.since > NEWS_RATE_WINDOW_MS) {
+    rec = { count: 1, since: n };
+    newsRateMap.set(ip, rec);
+    return true;
+  }
+  rec.count += 1;
+  if (rec.count > NEWS_RATE_MAX) return false;
+  return true;
+}
 
 // Node >=18 has global fetch
 
@@ -58,9 +146,22 @@ async function makePolygonRequest(path, params = {}) {
   return resp.json();
 }
 
+// Massive REST (Float, News, Benzinga) — https://massive.com/docs
+async function makeMassiveRequest(path, params = {}) {
+  const qs = new URLSearchParams({ ...params, apiKey: MASSIVE_API_KEY }).toString();
+  const url = `${MASSIVE_API_BASE}${path}?${qs}`;
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Massive ${resp.status}: ${text || resp.statusText}`);
+  }
+  return resp.json();
+}
+
 // ---------- Fundamentals (optional enrichment) ----------
 const FUND_CACHE = new Map();
 const TTL_MS = 24 * 60 * 60 * 1000;
+const FUND_CACHE_MAX = parseInt(process.env.FUND_CACHE_MAX, 10) || 5000;
 const now = () => Date.now();
 
 function cacheGet(key) {
@@ -70,7 +171,37 @@ function cacheGet(key) {
   return hit.val;
 }
 function cacheSet(key, val, ttl = TTL_MS) {
+  if (FUND_CACHE.size >= FUND_CACHE_MAX && !FUND_CACHE.has(key)) {
+    let minKey = null, minExp = Infinity;
+    for (const [k, v] of FUND_CACHE.entries()) {
+      if (v.exp < minExp) { minExp = v.exp; minKey = k; }
+    }
+    if (minKey != null) FUND_CACHE.delete(minKey);
+  }
   FUND_CACHE.set(key, { val, exp: now() + ttl });
+}
+
+// ---------- News cache (source + ticker + limit + cursor in key) ----------
+const NEWS_CACHE = new Map();
+const BENZINGA_TTL_MS = (parseInt(process.env.NEWS_CACHE_BENZINGA_SEC, 10) || 30) * 1000;
+const STOCKS_NEWS_TTL_MS = (parseInt(process.env.NEWS_CACHE_STOCKS_SEC, 10) || 180) * 1000;
+const NEWS_CACHE_MAX = parseInt(process.env.NEWS_CACHE_MAX, 10) || 2000;
+
+function newsCacheGet(key) {
+  const hit = NEWS_CACHE.get(key);
+  if (!hit) return null;
+  if (hit.exp < now()) { NEWS_CACHE.delete(key); return null; }
+  return hit.val;
+}
+function newsCacheSet(key, val, ttlMs) {
+  if (NEWS_CACHE.size >= NEWS_CACHE_MAX && !NEWS_CACHE.has(key)) {
+    let minKey = null, minExp = Infinity;
+    for (const [k, v] of NEWS_CACHE.entries()) {
+      if (v.exp < minExp) { minExp = v.exp; minKey = k; }
+    }
+    if (minKey != null) NEWS_CACHE.delete(minKey);
+  }
+  NEWS_CACHE.set(key, { val, exp: now() + ttlMs });
 }
 
 // limit concurrency for N async jobs
@@ -196,6 +327,30 @@ async function computeSnapshotGainers(limit = 50) {
   return { date: new Date().toISOString(), results: rows, source: "snapshot" };
 }
 
+// --- Route manifest (version + overview for clients) -----------------------
+const API_VERSION = "1.0.4";
+const ROUTE_MANIFEST = [
+  { method: "GET", path: "/health", desc: "Basic health" },
+  { method: "GET", path: "/api", desc: "Route manifest + version" },
+  { method: "GET", path: "/api/health", desc: "Health + services + version" },
+  { method: "GET", path: "/api/gainers", desc: "Top gainers (scanner)" },
+  { method: "GET", path: "/api/float/:symbol", desc: "Free float (Massive); ?cursor=" },
+  { method: "GET", path: "/api/historical/:symbol", desc: "Historical price data" },
+  { method: "GET", path: "/api/news/:symbol", desc: "News; ?source=benzinga|stocks&limit=&cursor=" },
+  { method: "GET", path: "/api/shared-tickers", desc: "List shared tickers" },
+  { method: "POST", path: "/api/shared-tickers", desc: "Add shared ticker (developer)" },
+  { method: "DELETE", path: "/api/shared-tickers/:symbol", desc: "Remove shared ticker" },
+  { method: "GET", path: "/gainers", desc: "Intraday top gainers" },
+  { method: "GET", path: "/market/top-gainers", desc: "Alias of /gainers" },
+  { method: "GET", path: "/symbol/:symbol", desc: "Polygon snapshot" },
+  { method: "GET", path: "/ohlcv/:symbol", desc: "Aggregates; ?session=pre|rth|post|all" },
+  { method: "GET", path: "/price/:symbol", desc: "Latest price" },
+  { method: "GET", path: "/previous_close/:symbol", desc: "Previous close" },
+  { method: "GET", path: "/historical/:symbol", desc: "Day/minute historical" },
+  { method: "GET", path: "/quote/:symbol", desc: "Quote (scanner)" },
+  { method: "WS", path: "/ws", desc: "Polygon WS passthrough" },
+];
+
 // --- Routes ----------------------------------------------------------------
 
 // Health
@@ -203,10 +358,91 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, status: "ok", message: "Server is running", timestamp: new Date().toISOString() });
 });
 
-// API Health endpoint for scanner compatibility
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, status: "ok", message: "Server is running", timestamp: new Date().toISOString() });
+// Route manifest + version (GET /api)
+app.get("/api", (_req, res) => {
+  res.json({ version: API_VERSION, routes: ROUTE_MANIFEST });
 });
+
+// API Health endpoint - safe, public endpoint with no secrets
+app.get("/api/health", (_req, res) => {
+  res.json({
+    status: "ok",
+    env: process.env.NODE_ENV || "production",
+    services: {
+      dialogflow: !!(process.env.DIALOGFLOW_PROJECT_ID && process.env.DIALOGFLOW_PRIVATE_KEY && process.env.DIALOGFLOW_CLIENT_EMAIL),
+      groq: !!process.env.AI_COMPAT_API_KEY,
+      polygon: !!process.env.POLYGON_API_KEY,
+      encryption: !!process.env.ENCRYPTION_KEY,
+      massive: !!(process.env.MASSIVE_API_KEY || process.env.POLYGON_API_KEY),
+      massiveBase: process.env.MASSIVE_API_BASE_URL || null,
+      benzinga: !!(process.env.MASSIVE_API_KEY || process.env.POLYGON_API_KEY),
+    },
+    version: API_VERSION,
+    routes: ROUTE_MANIFEST,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// API Config endpoint - SECURITY: Only mounted if ADMIN_TOKEN is set in production
+// In production without ADMIN_TOKEN: route is not mounted (returns 404)
+// In production with ADMIN_TOKEN: requires x-admin-token header matching ADMIN_TOKEN
+// In development: always available (for debugging)
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
+const isDevelopment = process.env.NODE_ENV !== 'production';
+
+if (isDevelopment || ADMIN_TOKEN) {
+  app.get("/api/config", (req, res) => {
+    // In production, require admin token
+    if (!isDevelopment) {
+      const adminToken = req.headers['x-admin-token'];
+      if (adminToken !== ADMIN_TOKEN) {
+        return res.status(401).json({ 
+          error: "Unauthorized",
+          message: "Missing or invalid x-admin-token header. Header value must equal ADMIN_TOKEN."
+        });
+      }
+    }
+    
+    // Redact sensitive values - only show last 4 chars
+    function redact(value) {
+      if (!value || typeof value !== 'string') return null;
+      if (value.length <= 4) return '****';
+      return '****' + value.slice(-4);
+    }
+    
+    res.json({
+      // Dialogflow Configuration (redacted)
+      dialogflow: {
+        projectId: process.env.DIALOGFLOW_PROJECT_ID || null,
+        clientEmail: process.env.DIALOGFLOW_CLIENT_EMAIL || null,
+        privateKey: redact(process.env.DIALOGFLOW_PRIVATE_KEY),
+      },
+      // Encryption (redacted)
+      encryption: {
+        key: redact(process.env.ENCRYPTION_KEY),
+      },
+      // Groq AI API Configuration (redacted)
+      ai: {
+        apiKey: redact(process.env.AI_COMPAT_API_KEY),
+        baseUrl: process.env.AI_COMPAT_BASE_URL || 'https://api.groq.com/openai/v1',
+        model: process.env.AI_COMPAT_MODEL || 'llama-3.3-70b-versatile',
+      },
+      // Server Configuration (safe to show)
+      server: {
+        port: process.env.PORT || 3000,
+        nodeEnv: process.env.NODE_ENV || 'production',
+      },
+      // CORS Configuration (safe to show)
+      cors: {
+        wixSiteUrl: process.env.WIX_SITE_URL || null,
+        frontendUrl: process.env.FRONTEND_URL || null,
+      },
+      timestamp: new Date().toISOString(),
+      warning: "This endpoint should only be used in development. Secrets are redacted.",
+    });
+  });
+}
+// If ADMIN_TOKEN is not set in production, /api/config is not mounted (returns 404)
 
 // ----- API endpoints for scanner compatibility -----
 app.get("/api/gainers", async (req, res) => {
@@ -234,11 +470,44 @@ app.get("/api/gainers", async (req, res) => {
   }
 });
 
+// Massive Float: https://massive.com/docs/rest/stocks/fundamentals/float
+// Returns free_float, free_float_percent, effective_date, ticker. Falls back to Polygon ticker overview if Massive fails.
+// Query: ?cursor= forwarded to Massive. If Massive expects the full next_url as the next request URL, call that URL directly or pass it as cursor per their docs.
 app.get("/api/float/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
-    const overview = await getTickerOverview(symbol);
-    res.json({ results: overview });
+    const ticker = String(symbol).toUpperCase();
+    const cursor = req.query.cursor || undefined;
+    const cacheKey = cursor ? null : `float:${ticker}`;
+    if (cacheKey) {
+      const cached = cacheGet(cacheKey);
+      if (cached) return res.json(cached);
+    }
+
+    try {
+      const params = { ticker, limit: 1 };
+      if (cursor) params.cursor = cursor;
+      const data = await makeMassiveRequest("/stocks/v1/float", params);
+      const results = (data?.results || [])[0] ?? null;
+      const out = results
+        ? {
+            ticker,
+            results: {
+              ticker: results.ticker,
+              free_float: results.free_float,
+              free_float_percent: results.free_float_percent,
+              effective_date: results.effective_date,
+            },
+            next_url: data?.next_url ?? null,
+            source: "massive",
+          }
+        : { ticker, results: null, next_url: data?.next_url ?? null, source: "massive" };
+      if (results && !cursor) cacheSet(cacheKey, out);
+      return res.json(out);
+    } catch (_) {
+      const overview = await getTickerOverview(symbol);
+      return res.json({ ticker, results: overview, source: "polygon" });
+    }
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -275,10 +544,74 @@ app.get("/api/historical/:symbol", async (req, res) => {
   }
 });
 
+// News: Benzinga (primary) or Stocks News via Massive. https://massive.com/docs/rest/partners/benzinga/news and /rest/stocks/news
+// Query: ?source=benzinga|stocks (default benzinga), ?limit=10, ?cursor= forwarded to Massive. If responses use next_url as full URL for "next page", use that URL per Massive docs.
+// Rate-limited per IP; cached (Benzinga ~30s, Stocks ~3min). Symbol validated.
 app.get("/api/news/:symbol", async (req, res) => {
+  const ip = req.ip || req.socket?.remoteAddress || "unknown";
+  if (!checkNewsRateLimit(ip)) {
+    return res.status(429).json({ error: "Too many requests", message: "News rate limit exceeded. Try again later." });
+  }
   try {
     const { symbol } = req.params;
-    res.json({ results: [] }); // Placeholder for news endpoint
+    const ticker = String(symbol).toUpperCase();
+    const source = (req.query.source || "benzinga").toLowerCase();
+    const limit = Math.min(parseInt(req.query.limit, 10) || 10, source === "benzinga" ? 100 : 1000);
+    const cursor = req.query.cursor || undefined;
+    const cacheKey = cursor ? null : `news:${source}:${ticker}:${limit}`;
+    if (cacheKey) {
+      const ttl = source === "benzinga" ? BENZINGA_TTL_MS : STOCKS_NEWS_TTL_MS;
+      const cached = newsCacheGet(cacheKey);
+      if (cached) return res.json(cached);
+    }
+
+    if (source === "stocks") {
+      const params = { ticker, limit, sort: "published_utc", order: "desc" };
+      if (cursor) params.cursor = cursor;
+      const data = await makeMassiveRequest("/v2/reference/news", params);
+      const results = (data?.results || []).map((r) => ({
+        id: r.id,
+        title: r.title,
+        author: r.author,
+        published_utc: r.published_utc || r.published || null,
+        article_url: r.article_url,
+        description: r.description,
+        image_url: r.image_url,
+        tickers: r.tickers,
+        publisher: r.publisher,
+      }));
+      const out = {
+        ticker,
+        results,
+        count: data?.count ?? results.length,
+        next_url: data?.next_url ?? null,
+        source: "stocks",
+      };
+      if (!cursor) newsCacheSet(cacheKey, out, STOCKS_NEWS_TTL_MS);
+      return res.json(out);
+    }
+
+    const params = { tickers: ticker, limit, sort: "published.desc" };
+    if (cursor) params.cursor = cursor;
+    const data = await makeMassiveRequest("/benzinga/v2/news", params);
+    const results = (data?.results || []).map((r) => ({
+      benzinga_id: r.benzinga_id,
+      title: r.title,
+      author: r.author,
+      published: r.published,
+      published_utc: r.published_utc || r.published || null,
+      last_updated: r.last_updated,
+      url: r.url,
+      teaser: r.teaser,
+      body: r.body,
+      tickers: r.tickers,
+      channels: r.channels,
+      tags: r.tags,
+      images: r.images,
+    }));
+    const out = { ticker, results, next_url: data?.next_url ?? null, source: "benzinga" };
+    if (!cursor) newsCacheSet(cacheKey, out, BENZINGA_TTL_MS);
+    return res.json(out);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1078,11 +1411,15 @@ function checkTradingDayReset() {
   }
 }
 
-// Helper to check if user is in developer mode
+// Helper to check if user is in developer mode (allowed: admin + joeyrooker06 / greenhorizontrading06)
 function isDeveloperMode(req) {
   const userEmail = req.headers['x-user-email'] || '';
   const email = userEmail.trim().toLowerCase();
-  return email === 'admin@example.com' || email === 'admin2@example.com';
+  return (
+    email === 'admin@example.com' ||
+    email === 'joeyrooker06@gmail.com' ||
+    email === 'greenhorizontrading06@gmail.com'
+  );
 }
 
 // GET /api/shared-tickers - Get all shared tickers
@@ -1110,7 +1447,10 @@ app.post("/api/shared-tickers", (req, res) => {
     if (!symbol) {
       return res.status(400).json({ error: "Symbol is required" });
     }
-    const ticker = symbol.toUpperCase().trim();
+    const ticker = String(symbol).toUpperCase().trim();
+    if (!validTicker(ticker)) {
+      return res.status(400).json({ error: "Invalid symbol", ticker });
+    }
     sharedTickers.set(ticker, {
       symbol: ticker,
       addedAt: new Date().toISOString(),
@@ -1136,6 +1476,11 @@ app.delete("/api/shared-tickers/:symbol", (req, res) => {
   } catch (e) {
     res.status(500).json({ error: "Failed to remove shared ticker", message: String(e.message || e) });
   }
+});
+
+// Catch-all 404 (JSON; avoids Express default "Cannot GET /…")
+app.use((req, res) => {
+  res.status(404).json({ error: "Not found", path: req.path });
 });
 
 // --- WebSocket passthrough (optional) --------------------------------------
@@ -1171,3 +1516,19 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`   GET  http://0.0.0.0:${PORT}/api/gainers`);
   console.log(`   WS   ws://0.0.0.0:${PORT}/ws`);
 });
+
+// Graceful shutdown: stop accepting new connections, then exit
+const SHUTDOWN_GRACE_MS = parseInt(process.env.SHUTDOWN_GRACE_MS, 10) || 10000;
+function shutdown(sig) {
+  console.log(`\n${sig} received, closing server…`);
+  server.close(() => {
+    console.log("Server closed.");
+    process.exit(0);
+  });
+  setTimeout(() => {
+    console.error("Shutdown grace period expired, forcing exit.");
+    process.exit(1);
+  }, SHUTDOWN_GRACE_MS).unref();
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
