@@ -289,7 +289,7 @@ async function computeGainers(limit = 50) {
       };
     })
     .sort((a, b) => b.pctChange - a.pctChange)
-    .slice(0, Math.min(limit, 200));
+    .slice(0, Math.min(limit, 500));
   return { date: dateStr, results: rows, source: "grouped" };
 }
 
@@ -322,7 +322,7 @@ async function computeSnapshotGainers(limit = 50) {
     })
     .filter(x => x.ticker && x.pctChange != null)
     .sort((a, b) => (b.pctChange ?? -Infinity) - (a.pctChange ?? -Infinity))
-    .slice(0, Math.min(limit, 200));
+    .slice(0, Math.min(limit, 500));
 
   return { date: new Date().toISOString(), results: rows, source: "snapshot" };
 }
@@ -447,23 +447,45 @@ if (isDevelopment || ADMIN_TOKEN) {
 // ----- API endpoints for scanner compatibility -----
 app.get("/api/gainers", async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit || "50", 10);
-    let data;
+    const limit = Math.min(parseInt(req.query.limit || "50", 10) || 50, 500);
+    const seen = new Set();
+    const tickers = [];
+
+    // 1) Snapshot returns only ~20 tickers (Polygon limit). Get live top gainers first.
     try {
-      data = await computeSnapshotGainers(limit);   // intraday (live-ish)
-    } catch (_) {
-      data = await computeGainers(limit);           // fallback
+      const snapshot = await computeSnapshotGainers(limit);
+      for (const row of snapshot.results || []) {
+        if (row.ticker && !seen.has(row.ticker)) {
+          seen.add(row.ticker);
+          tickers.push({
+            ticker: row.ticker,
+            price: row.last || row.close,
+            change: row.change,
+            change_pct: row.pctChange,
+            volume: row.volume
+          });
+        }
+      }
+    } catch (_) { /* snapshot failed, will use grouped only */ }
+
+    // 2) If we need more tickers (e.g. scanner asked for 500), fill from grouped/day gainers.
+    if (tickers.length < limit) {
+      const grouped = await computeGainers(limit);
+      for (const row of grouped.results || []) {
+        if (tickers.length >= limit) break;
+        if (row.ticker && !seen.has(row.ticker)) {
+          seen.add(row.ticker);
+          tickers.push({
+            ticker: row.ticker,
+            price: row.close,
+            change: row.change,
+            change_pct: row.pctChange,
+            volume: row.volume
+          });
+        }
+      }
     }
-    
-    // Convert to the format expected by the scanner
-    const tickers = data.results.map(row => ({
-      ticker: row.ticker,
-      price: row.last || row.close,
-      change: row.change,
-      change_pct: row.pctChange,
-      volume: row.volume
-    }));
-    
+
     res.json({ tickers });
   } catch (error) {
     res.status(500).json({ error: error.message });
