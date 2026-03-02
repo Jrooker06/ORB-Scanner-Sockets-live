@@ -13,7 +13,7 @@
  *   POST /api/shared-tickers            -> Add a shared ticker (developer mode only)
  *   DELETE /api/shared-tickers/:symbol  -> Remove a shared ticker
  *   GET  /gainers                       -> Intraday top gainers (snapshot API) w/ grouped fallback
- *   GET  /most_active                   -> Most active by volume (?limit=N); grouped-day data
+ *   GET  /most_active                   -> Most active by volume (?limit=N)
  *   GET  /market/top-gainers            -> Alias of /gainers
  *   GET  /symbol/:symbol                -> Polygon symbol snapshot passthrough
  *   GET  /ohlcv/:symbol                 -> Aggregates with optional session filter (pre/rth/post/all)
@@ -334,12 +334,11 @@ async function computeMostActive(limit = 50) {
   const rows = (grouped?.results || [])
     .filter(r => r && r.T && typeof r.v === "number" && r.v > 0)
     .map(r => {
-      const last = r.c;
       const prev = r.o;
-      const pct = prev > 0 ? (r.c - r.o) / r.o : null;
+      const pct = typeof r.o === "number" && r.o > 0 && typeof r.c === "number" ? (r.c - r.o) / r.o : null;
       return {
         ticker: r.T,
-        last,
+        last: r.c,
         previousClose: prev,
         change: typeof r.c === "number" && typeof r.o === "number" ? +(r.c - r.o).toFixed(4) : null,
         pctChange: pct != null ? +(pct * 100).toFixed(2) : null,
@@ -353,7 +352,7 @@ async function computeMostActive(limit = 50) {
 }
 
 // --- Route manifest (version + overview for clients) -----------------------
-const API_VERSION = "1.0.4";
+const API_VERSION = "1.0.5";
 const ROUTE_MANIFEST = [
   { method: "GET", path: "/health", desc: "Basic health" },
   { method: "GET", path: "/api", desc: "Route manifest + version" },
