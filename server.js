@@ -13,8 +13,7 @@
  *   POST /api/shared-tickers            -> Add a shared ticker (developer mode only)
  *   DELETE /api/shared-tickers/:symbol  -> Remove a shared ticker
  *   GET  /gainers                       -> Intraday top gainers (snapshot API) w/ grouped fallback
- *   GET  /most_active                   -> Intraday most active by volume (scanner compatibility)
- *   GET  /news/:symbol                  -> Alias of /api/news/:symbol (scanner compatibility)
+ *   GET  /most_active                   -> Most active by volume (?limit=N); grouped-day data
  *   GET  /market/top-gainers            -> Alias of /gainers
  *   GET  /symbol/:symbol                -> Polygon symbol snapshot passthrough
  *   GET  /ohlcv/:symbol                 -> Aggregates with optional session filter (pre/rth/post/all)
@@ -329,6 +328,30 @@ async function computeSnapshotGainers(limit = 50) {
   return { date: new Date().toISOString(), results: rows, source: "snapshot" };
 }
 
+// ----- Most active by volume (grouped day; Polygon has no snapshot "actives") -----
+async function computeMostActive(limit = 50) {
+  const { dateStr, grouped } = await findLastTradingDayNY(5);
+  const rows = (grouped?.results || [])
+    .filter(r => r && r.T && typeof r.v === "number" && r.v > 0)
+    .map(r => {
+      const last = r.c;
+      const prev = r.o;
+      const pct = prev > 0 ? (r.c - r.o) / r.o : null;
+      return {
+        ticker: r.T,
+        last,
+        previousClose: prev,
+        change: typeof r.c === "number" && typeof r.o === "number" ? +(r.c - r.o).toFixed(4) : null,
+        pctChange: pct != null ? +(pct * 100).toFixed(2) : null,
+        volume: r.v,
+        date: dateStr,
+      };
+    })
+    .sort((a, b) => (b.volume ?? 0) - (a.volume ?? 0))
+    .slice(0, Math.min(limit, 200));
+  return { date: dateStr, results: rows, source: "grouped" };
+}
+
 // --- Route manifest (version + overview for clients) -----------------------
 const API_VERSION = "1.0.4";
 const ROUTE_MANIFEST = [
@@ -343,8 +366,7 @@ const ROUTE_MANIFEST = [
   { method: "POST", path: "/api/shared-tickers", desc: "Add shared ticker (developer)" },
   { method: "DELETE", path: "/api/shared-tickers/:symbol", desc: "Remove shared ticker" },
   { method: "GET", path: "/gainers", desc: "Intraday top gainers" },
-  { method: "GET", path: "/most_active", desc: "Intraday most active by volume" },
-  { method: "GET", path: "/news/:symbol", desc: "News (alias of /api/news/:symbol)" },
+  { method: "GET", path: "/most_active", desc: "Most active by volume; ?limit=N" },
   { method: "GET", path: "/market/top-gainers", desc: "Alias of /gainers" },
   { method: "GET", path: "/symbol/:symbol", desc: "Polygon snapshot" },
   { method: "GET", path: "/ohlcv/:symbol", desc: "Aggregates; ?session=pre|rth|post|all" },
@@ -1166,35 +1188,7 @@ app.get("/gainers", async (req, res) => {
   }
 });
 
-// ----- Most active (by volume) for scanner compatibility -----
-// Polygon: /v2/snapshot/locale/us/markets/stocks/actives (when available) or derive from grouped
-async function computeMostActive(limit = 50) {
-  try {
-    const data = await makePolygonRequest(`/v2/snapshot/locale/us/markets/stocks/actives`);
-    const rows = (data?.tickers || data?.results || [])
-      .map(r => {
-        const tkr = r.ticker || r.T || r.symbol;
-        const last = r.lastTrade?.p ?? r.last?.price ?? r.lastQuote?.p ?? null;
-        const vol = r.day?.v ?? r.volume ?? null;
-        const prev = r.prevDay?.c ?? r.prevClose ?? r.day?.o ?? null;
-        const todaysChangePerc = r.todaysChangePerc ?? (last != null && prev != null ? +(((last - prev) / prev) * 100).toFixed(2) : null);
-        return { ticker: tkr, last, volume: vol, pctChange: todaysChangePerc };
-      })
-      .filter(x => x.ticker && (x.volume != null && x.volume > 0))
-      .sort((a, b) => (b.volume ?? 0) - (a.volume ?? 0))
-      .slice(0, Math.min(limit, 200));
-    return { date: new Date().toISOString(), results: rows, source: "snapshot" };
-  } catch (_) {
-    const { dateStr, grouped } = await findLastTradingDayNY(5);
-    const rows = (grouped?.results || [])
-      .filter(r => r && r.v > 0)
-      .map(r => ({ ticker: r.T, last: r.c, volume: r.v, pctChange: r.o ? +(((r.c - r.o) / r.o) * 100).toFixed(2) : null }))
-      .sort((a, b) => (b.volume ?? 0) - (a.volume ?? 0))
-      .slice(0, Math.min(limit, 200));
-    return { date: dateStr, results: rows, source: "grouped" };
-  }
-}
-
+// ----- Most active by volume (ORB Scanner / verification script) -----
 app.get("/most_active", async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || "50", 10);
@@ -1203,13 +1197,6 @@ app.get("/most_active", async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: "Failed to fetch most active", message: String(e.message || e) });
   }
-});
-
-// ----- News alias (scanner calls /news/:symbol; server has /api/news/:symbol) -----
-app.get("/news/:symbol", (req, res) => {
-  const qs = new URLSearchParams(req.query).toString();
-  const path = "/api/news/" + encodeURIComponent(req.params.symbol) + (qs ? "?" + qs : "");
-  res.redirect(308, path);
 });
 
 // alias
