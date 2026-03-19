@@ -6,6 +6,7 @@
  *   GET  /api                            -> Route manifest + version (no token)
  *   GET  /api/health                    -> Health check for scanner compatibility
  *   GET  /api/gainers                   -> Top gainers for scanner (formatted)
+ *   POST /api/scan/rct                  -> Server-side batch RCT scan
  *   GET  /api/float/:symbol             -> Free float (Massive); fallback Polygon ticker overview
  *   GET  /api/historical/:symbol        -> Historical price data
  *   GET  /api/news/:symbol              -> News via Massive (?source=benzinga|stocks, ?limit=N)
@@ -260,7 +261,7 @@ async function fetchGrouped(dateStr) {
 }
 
 // Walk back up to N NY-calendar days to find a trading day with grouped results
-async function findLastTradingDayNY(maxBack = 5) {
+async function findLastTradingDayNY(maxBack = 15) {
   let d = new Date();
   for (let i = 0; i < maxBack; i++) {
     const dateStr = ymdNY(d);
@@ -274,7 +275,7 @@ async function findLastTradingDayNY(maxBack = 5) {
 
 // ----- Previous-day gainers (fallback) -----
 async function computeGainers(limit = 50) {
-  const { dateStr, grouped } = await findLastTradingDayNY(5);
+  const { dateStr, grouped } = await findLastTradingDayNY(15);
   const rows = (grouped?.results || [])
     .filter(r => r && typeof r.o === "number" && r.o > 0 && typeof r.c === "number")
     .map(r => {
@@ -290,7 +291,7 @@ async function computeGainers(limit = 50) {
       };
     })
     .sort((a, b) => b.pctChange - a.pctChange)
-    .slice(0, Math.min(limit, 200));
+    .slice(0, Math.min(limit, 500));
   return { date: dateStr, results: rows, source: "grouped" };
 }
 
@@ -323,7 +324,7 @@ async function computeSnapshotGainers(limit = 50) {
     })
     .filter(x => x.ticker && x.pctChange != null)
     .sort((a, b) => (b.pctChange ?? -Infinity) - (a.pctChange ?? -Infinity))
-    .slice(0, Math.min(limit, 200));
+    .slice(0, Math.min(limit, 500));
 
   return { date: new Date().toISOString(), results: rows, source: "snapshot" };
 }
@@ -352,12 +353,14 @@ async function computeMostActive(limit = 50) {
 }
 
 // --- Route manifest (version + overview for clients) -----------------------
-const API_VERSION = "1.0.5";
+const API_VERSION = "1.0.6";
 const ROUTE_MANIFEST = [
   { method: "GET", path: "/health", desc: "Basic health" },
   { method: "GET", path: "/api", desc: "Route manifest + version" },
   { method: "GET", path: "/api/health", desc: "Health + services + version" },
   { method: "GET", path: "/api/gainers", desc: "Top gainers (scanner)" },
+  { method: "POST", path: "/api/scan/rct", desc: "Server-side batch RCT scan" },
+  { method: "GET", path: "/api/market-tickers", desc: "Whole market tickers (all US stocks from last trading day)" },
   { method: "GET", path: "/api/float/:symbol", desc: "Free float (Massive); ?cursor=" },
   { method: "GET", path: "/api/historical/:symbol", desc: "Historical price data" },
   { method: "GET", path: "/api/news/:symbol", desc: "News; ?source=benzinga|stocks&limit=&cursor=" },
@@ -472,24 +475,192 @@ if (isDevelopment || ADMIN_TOKEN) {
 // ----- API endpoints for scanner compatibility -----
 app.get("/api/gainers", async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit || "50", 10);
-    let data;
+    const limit = Math.min(parseInt(req.query.limit || "50", 10) || 50, 500);
+    const seen = new Set();
+    const tickers = [];
+
+    // Snapshot returns only about 20 names; use it first for live movers.
     try {
-      data = await computeSnapshotGainers(limit);   // intraday (live-ish)
-    } catch (_) {
-      data = await computeGainers(limit);           // fallback
+      const snapshot = await computeSnapshotGainers(limit);
+      for (const row of snapshot.results || []) {
+        if (row.ticker && !seen.has(row.ticker)) {
+          seen.add(row.ticker);
+          tickers.push({
+            ticker: row.ticker,
+            price: row.last || row.close,
+            change: row.change,
+            change_pct: row.pctChange,
+            volume: row.volume
+          });
+        }
+      }
+    } catch (_) { /* snapshot failed; grouped fallback below */ }
+
+    // Backfill with grouped daily results so the client can request more than ~20.
+    if (tickers.length < limit) {
+      try {
+        const grouped = await computeGainers(limit);
+        for (const row of grouped.results || []) {
+          if (tickers.length >= limit) break;
+          if (row.ticker && !seen.has(row.ticker)) {
+            seen.add(row.ticker);
+            tickers.push({
+              ticker: row.ticker,
+              price: row.close,
+              change: row.change,
+              change_pct: row.pctChange,
+              volume: row.volume
+            });
+          }
+        }
+      } catch (e) {
+        console.warn("api/gainers grouped fallback failed:", e?.message || e);
+      }
     }
-    
-    // Convert to the format expected by the scanner
-    const tickers = data.results.map(row => ({
-      ticker: row.ticker,
-      price: row.last || row.close,
-      change: row.change,
-      change_pct: row.pctChange,
-      volume: row.volume
-    }));
-    
+
     res.json({ tickers });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Whole market: all US stocks from the last trading day using grouped daily bars.
+app.get("/api/market-tickers", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || "10000", 10) || 10000, 50000);
+    const { dateStr, grouped } = await findLastTradingDayNY(15);
+    const tickers = (grouped?.results || [])
+      .filter(r => r && r.T && typeof r.o === "number" && r.o > 0 && typeof r.c === "number")
+      .slice(0, limit)
+      .map(r => ({
+        ticker: r.T,
+        price: r.c,
+        volume: r.v
+      }));
+
+    res.json({ tickers, date: dateStr, count: tickers.length });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Server-side batch RCT scan (non-breaking additive endpoint)
+app.post("/api/scan/rct", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const inTickers = Array.isArray(body.tickers) ? body.tickers : [];
+    const inWatchlist = Array.isArray(body.watchlist_tickers) ? body.watchlist_tickers : [];
+    const s = body.settings || {};
+
+    const rctSettings = {
+      price_min: Number(s.price_min ?? 0.2),
+      price_max: Number(s.price_max ?? 20.0),
+      day_change_percent_min: Number(s.day_change_percent_min ?? 20.0),
+      float_max: Number(s.float_max ?? 15_000_000),
+      daily_volume_min: Number(s.daily_volume_min ?? 1_000_000),
+    };
+
+    const tickers = Array.from(new Set(
+      inTickers.map(t => String(t || "").trim().toUpperCase()).filter(validTicker)
+    ));
+    const watchlist = new Set(
+      inWatchlist.map(t => String(t || "").trim().toUpperCase()).filter(validTicker)
+    );
+
+    if (!tickers.length) {
+      return res.json({ results: [], meta: { total: 0, scanned: 0 } });
+    }
+
+    // Keep server load controlled; this path is for speed but should not starve other routes.
+    const workerLimit = 20;
+    const dateStr = ymdNY();
+
+    const rows = await limitedMap(tickers, workerLimit, async (ticker) => {
+      try {
+        const snap = await makePolygonRequest(
+          `/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(ticker)}`
+        );
+        const t = snap?.ticker || snap?.results || {};
+        const last = t?.lastTrade?.p ?? t?.day?.c ?? null;
+        const prev = t?.prevDay?.c ?? t?.day?.o ?? null;
+        const dailyVol = t?.day?.v ?? null;
+        if (typeof last !== "number" || typeof prev !== "number" || prev <= 0) {
+          return null;
+        }
+
+        const dayPct = ((last - prev) / prev) * 100.0;
+        const inPrice = last >= rctSettings.price_min && last <= rctSettings.price_max;
+        const inChg = dayPct >= rctSettings.day_change_percent_min;
+        const inVol = typeof dailyVol === "number" && dailyVol >= rctSettings.daily_volume_min;
+        const isWatch = watchlist.has(ticker);
+
+        if (!isWatch && (!inPrice || !inChg || !inVol)) {
+          return null;
+        }
+
+        // Float/sector enrichment used for float filter + display. Fallback to Polygon overview.
+        let rawFloat = null;
+        let sector = "";
+        try {
+          const f = await makeMassiveRequest("/stocks/v1/float", { ticker, limit: 1 });
+          const fr = (f?.results || [])[0] || null;
+          if (fr && typeof fr.free_float === "number" && fr.free_float > 0) {
+            rawFloat = Math.floor(fr.free_float);
+            sector = (fr.sector || "").trim();
+          }
+        } catch (_) {
+          try {
+            const o = await getTickerOverview(ticker);
+            rawFloat = o?.weightedSharesOut ?? o?.shareClassSharesOut ?? null;
+            sector = o?.sector || "";
+          } catch (_) {}
+        }
+
+        const inFloat = rawFloat == null ? true : rawFloat <= rctSettings.float_max;
+        if (!isWatch && !inFloat) {
+          return null;
+        }
+
+        return {
+          ticker,
+          last_price: last,
+          day_change_percent: +dayPct.toFixed(2),
+          orb_high: 0.0,
+          orb_low: 0.0,
+          distance_to_orb_high: 0,
+          distance_to_orb_high_percent: 0,
+          volume_1m: null,
+          volume_5m: null,
+          volume_1m_prev: null,
+          volume_5m_prev: null,
+          daily_volume: typeof dailyVol === "number" ? dailyVol : 0,
+          vwap: null,
+          ema: null,
+          has_news: false,
+          float: rawFloat,
+          float_formatted: null,
+          sector,
+          news_header: "",
+          news_link: "",
+          rct_passed: inPrice && inChg && inVol && inFloat,
+          scan_date: dateStr,
+        };
+      } catch (_) {
+        return null;
+      }
+    });
+
+    const results = rows.filter(Boolean);
+    res.json({
+      results,
+      meta: {
+        total: tickers.length,
+        scanned: tickers.length,
+        returned: results.length,
+        mode: "rct",
+        worker_limit: workerLimit,
+      }
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
