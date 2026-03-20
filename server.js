@@ -220,6 +220,15 @@ async function limitedMap(items, limit, worker) {
   return out;
 }
 
+/** Human-readable share count for UI (matches desktop scanner style) */
+function formatShareCount(val) {
+  if (typeof val !== "number" || val <= 0) return null;
+  if (val >= 1_000_000_000) return `${(val / 1_000_000_000).toFixed(2)}B`;
+  if (val >= 1_000_000) return `${(val / 1_000_000).toFixed(2)}M`;
+  if (val >= 1_000) return `${(val / 1_000).toFixed(2)}K`;
+  return String(Math.floor(val));
+}
+
 async function getTickerOverview(ticker) {
   const key = `ovr:${ticker}`;
   const cached = cacheGet(key);
@@ -353,7 +362,7 @@ async function computeMostActive(limit = 50) {
 }
 
 // --- Route manifest (version + overview for clients) -----------------------
-const API_VERSION = "1.0.6";
+const API_VERSION = "1.0.7";
 const ROUTE_MANIFEST = [
   { method: "GET", path: "/health", desc: "Basic health" },
   { method: "GET", path: "/api", desc: "Route manifest + version" },
@@ -626,6 +635,11 @@ app.post("/api/scan/rct", async (req, res) => {
           return null;
         }
 
+        // Snapshot fields work in premarket; show liquidity volume used for RCT gate (not just today session v).
+        const minAgg = t?.min;
+        const vol1m = typeof minAgg?.v === "number" ? minAgg.v : null;
+        const dayVwap = typeof t?.day?.vw === "number" && t.day.vw > 0 ? t.day.vw : null;
+
         return {
           ticker,
           last_price: last,
@@ -634,16 +648,19 @@ app.post("/api/scan/rct", async (req, res) => {
           orb_low: 0.0,
           distance_to_orb_high: 0,
           distance_to_orb_high_percent: 0,
-          volume_1m: null,
+          volume_1m: vol1m,
           volume_5m: null,
           volume_1m_prev: null,
           volume_5m_prev: null,
-          daily_volume: dayV,
-          vwap: null,
+          // Premarket: day.v is often 0 early; volForRct matches the liquidity check (max today vs prior day).
+          daily_volume: volForRct,
+          rct_volume_today: dayV,
+          rct_volume_prior_day: prevDayV,
+          vwap: dayVwap,
           ema: null,
           has_news: false,
           float: rawFloat,
-          float_formatted: null,
+          float_formatted: rawFloat != null ? formatShareCount(rawFloat) : null,
           sector,
           news_header: "",
           news_link: "",
@@ -655,7 +672,34 @@ app.post("/api/scan/rct", async (req, res) => {
       }
     });
 
-    const results = rows.filter(Boolean);
+    let results = rows.filter(Boolean);
+
+    // Optional: first-screen news for a limited number of matches (batch path skips per-ticker news by default).
+    const enrichNews = body.enrich_news !== false;
+    const newsCap = Math.min(50, Math.max(0, parseInt(body.news_enrich_cap ?? "50", 10) || 50));
+    if (enrichNews && results.length && newsCap > 0) {
+      const top = results.slice(0, newsCap);
+      const rest = results.slice(newsCap);
+      const withNews = await limitedMap(top, 8, async (row) => {
+        const ticker = row.ticker;
+        try {
+          const data = await makeMassiveRequest("/benzinga/v2/news", {
+            tickers: ticker,
+            limit: 1,
+            sort: "published.desc",
+          });
+          const item = (data?.results || [])[0];
+          if (item && (item.title || item.headline)) {
+            row.has_news = true;
+            row.news_header = String(item.title || item.headline || "").trim();
+            row.news_link = String(item.url || item.article_url || "").trim();
+          }
+        } catch (_) {}
+        return row;
+      });
+      results = withNews.concat(rest);
+    }
+
     res.json({
       results,
       meta: {
@@ -664,6 +708,8 @@ app.post("/api/scan/rct", async (req, res) => {
         returned: results.length,
         mode: "rct",
         worker_limit: workerLimit,
+        volume_note:
+          "daily_volume is max(prevDay.v, day.v) for RCT liquidity vs threshold; rct_volume_today / rct_volume_prior_day split.",
       }
     });
   } catch (error) {
