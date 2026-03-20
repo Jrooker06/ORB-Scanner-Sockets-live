@@ -582,8 +582,12 @@ app.post("/api/scan/rct", async (req, res) => {
         );
         const t = snap?.ticker || snap?.results || {};
         const last = t?.lastTrade?.p ?? t?.day?.c ?? null;
-        const prev = t?.prevDay?.c ?? t?.day?.o ?? null;
-        const dailyVol = t?.day?.v ?? null;
+        // Must use prior official close for % chg (do not fall back to today's open).
+        const prev = t?.prevDay?.c ?? null;
+        const dayV = typeof t?.day?.v === "number" ? t.day.v : 0;
+        const prevDayV = typeof t?.prevDay?.v === "number" ? t.prevDay.v : 0;
+        // Early session: today v is often still building; liquidity screeners often allow prior-day vol.
+        const volForRct = Math.max(dayV, prevDayV);
         if (typeof last !== "number" || typeof prev !== "number" || prev <= 0) {
           return null;
         }
@@ -591,14 +595,15 @@ app.post("/api/scan/rct", async (req, res) => {
         const dayPct = ((last - prev) / prev) * 100.0;
         const inPrice = last >= rctSettings.price_min && last <= rctSettings.price_max;
         const inChg = dayPct >= rctSettings.day_change_percent_min;
-        const inVol = typeof dailyVol === "number" && dailyVol >= rctSettings.daily_volume_min;
+        const inVol = volForRct >= rctSettings.daily_volume_min;
         const isWatch = watchlist.has(ticker);
 
         if (!isWatch && (!inPrice || !inChg || !inVol)) {
           return null;
         }
 
-        // Float/sector enrichment used for float filter + display. Fallback to Polygon overview.
+        // Float: only trust Massive free_float for RCT filter. Polygon overview "shares out"
+        // is NOT float — using it caused almost all names to fail float_max.
         let rawFloat = null;
         let sector = "";
         try {
@@ -608,11 +613,11 @@ app.post("/api/scan/rct", async (req, res) => {
             rawFloat = Math.floor(fr.free_float);
             sector = (fr.sector || "").trim();
           }
-        } catch (_) {
+        } catch (_) {}
+        if (!sector) {
           try {
             const o = await getTickerOverview(ticker);
-            rawFloat = o?.weightedSharesOut ?? o?.shareClassSharesOut ?? null;
-            sector = o?.sector || "";
+            sector = (o?.sector || "").trim();
           } catch (_) {}
         }
 
@@ -633,7 +638,7 @@ app.post("/api/scan/rct", async (req, res) => {
           volume_5m: null,
           volume_1m_prev: null,
           volume_5m_prev: null,
-          daily_volume: typeof dailyVol === "number" ? dailyVol : 0,
+          daily_volume: dayV,
           vwap: null,
           ema: null,
           has_news: false,
