@@ -39,11 +39,13 @@
  *   PORT                     (default 8080)
  */
 
-try { require("dotenv").config(); } catch (_) {}
+try { require("dotenv").config(); } catch (_) { }
 
 const http = require("http");
 const express = require("express");
 const cors = require("cors");
+const compression = require("compression");
+const helmet = require("helmet");
 const WebSocket = require("ws");
 
 // --- App setup ---
@@ -51,7 +53,23 @@ const app = express();
 if (process.env.TRUST_PROXY === "1" || process.env.TRUST_PROXY === "true") {
   app.set("trust proxy", 1);
 }
-app.use(cors());
+// CORS: allowlist in production via CORS_ORIGINS="https://app1,https://app2"
+const CORS_ORIGINS = String(process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // curl/postman/desktop apps
+    if (CORS_ORIGINS.length === 0) return cb(null, true); // default permissive
+    return cb(null, CORS_ORIGINS.includes(origin));
+  },
+  credentials: false
+}));
+app.use(helmet({
+  contentSecurityPolicy: false, // API server; avoid breaking if served behind something else
+}));
+app.use(compression());
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
@@ -61,6 +79,11 @@ if (!POLYGON_API_KEY) throw new Error("POLYGON_API_KEY is not set");
 const MASSIVE_API_BASE = (process.env.MASSIVE_API_BASE_URL || "https://api.massive.com").replace(/\/$/, "");
 const MASSIVE_API_KEY = process.env.MASSIVE_API_KEY || POLYGON_API_KEY;
 
+// Upstream reliability
+const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS, 10) || 12000;
+const UPSTREAM_RETRIES = parseInt(process.env.UPSTREAM_RETRIES, 10) || 2; // additional attempts after the first
+const UPSTREAM_MAX_BODY_CHARS = parseInt(process.env.UPSTREAM_MAX_BODY_CHARS, 10) || 2000;
+
 // --- Security middleware ---
 // App token middleware for stock endpoints (protects Polygon quota)
 const APP_TOKEN = process.env.APP_TOKEN;
@@ -69,7 +92,7 @@ if (isProduction && !APP_TOKEN) {
   throw new Error("APP_TOKEN is required in production. Set APP_TOKEN in env.");
 }
 function requireAppToken(req, res, next) {
-  if (req.path === "/api/health" || req.path === "/health" || req.path === "/api") return next();
+  if (req.path === "/api/health" || req.path === "/health" || req.path === "/api" || req.path === "/metrics") return next();
   if (!APP_TOKEN) return next();
   const token = req.headers["x-app-token"];
   if (token !== APP_TOKEN) {
@@ -87,6 +110,49 @@ app.use((req, res, next) => {
     console.log(`${req.method} ${req.path} ${res.statusCode} ${Date.now() - start}ms`);
   });
   next();
+});
+
+// Basic in-memory metrics (no deps)
+const METRICS = {
+  startedAt: Date.now(),
+  requestsTotal: 0,
+  errorsTotal: 0,
+  byRoute: new Map(), // key => {count, errors, totalMs}
+};
+app.use((req, res, next) => {
+  const t0 = Date.now();
+  METRICS.requestsTotal += 1;
+
+  res.on("finish", () => {
+    const ms = Date.now() - t0;
+    const key = `${req.method} ${req.route?.path || req.path}`;
+    const rec = METRICS.byRoute.get(key) || { count: 0, errors: 0, totalMs: 0 };
+    rec.count += 1;
+    rec.totalMs += ms;
+    if (res.statusCode >= 400) rec.errors += 1;
+    if (res.statusCode >= 500) METRICS.errorsTotal += 1;
+    METRICS.byRoute.set(key, rec);
+  });
+
+  next();
+});
+
+app.get("/metrics", (req, res) => {
+  const routes = {};
+  for (const [k, v] of METRICS.byRoute.entries()) {
+    routes[k] = {
+      count: v.count,
+      errors: v.errors,
+      avgMs: v.count ? Math.round(v.totalMs / v.count) : 0
+    };
+  }
+  res.json({
+    startedAt: METRICS.startedAt,
+    uptimeSec: Math.floor((Date.now() - METRICS.startedAt) / 1000),
+    requestsTotal: METRICS.requestsTotal,
+    errorsTotal: METRICS.errorsTotal,
+    routes
+  });
 });
 
 // Ticker validation: 1–10 uppercase letters or BRK.B-style (e.g. BRK.B)
@@ -133,31 +199,120 @@ function checkNewsRateLimit(ip) {
 }
 
 // Node >=18 has global fetch
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+function trunc(s, n) {
+  const str = String(s || "");
+  if (str.length <= n) return str;
+  return str.slice(0, n) + "…";
+}
+
+class UpstreamError extends Error {
+  constructor(message, { service, url, status, body, attempt }) {
+    super(message);
+    this.name = "UpstreamError";
+    this.service = service || null;
+    this.url = url || null;
+    this.status = status || null;
+    this.body = body || null;
+    this.attempt = attempt || 1;
+  }
+}
+
+async function fetchJsonWithPolicy(url, { service, timeoutMs = UPSTREAM_TIMEOUT_MS, retries = UPSTREAM_RETRIES } = {}) {
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= 1 + retries; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error("Upstream timeout")), timeoutMs);
+
+    try {
+      const resp = await fetch(url, { signal: controller.signal });
+      const retryAfter = resp.headers?.get?.("retry-after");
+
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        const body = trunc(text, UPSTREAM_MAX_BODY_CHARS);
+
+        const err = new UpstreamError(`${service || "Upstream"} ${resp.status}`, {
+          service,
+          url,
+          status: resp.status,
+          body,
+          attempt
+        });
+        lastErr = err;
+
+        const shouldRetry = resp.status === 429 || resp.status >= 500;
+        if (shouldRetry && attempt < 1 + retries) {
+          const backoffMs = retryAfter ? Math.min(30_000, parseInt(retryAfter, 10) * 1000) : (250 * Math.pow(2, attempt - 1));
+          await sleep(backoffMs);
+          continue;
+        }
+
+        throw err;
+      }
+
+      return resp.json();
+    } catch (e) {
+      lastErr = e;
+      const isAbort = e?.name === "AbortError" || String(e?.message || "").toLowerCase().includes("timeout");
+      if ((isAbort || e instanceof UpstreamError) && attempt < 1 + retries) {
+        await sleep(250 * Math.pow(2, attempt - 1));
+        continue;
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  throw lastErr || new Error("Upstream request failed");
+}
+
+function jsonError(res, status, payload) {
+  res.status(status).json(payload);
+}
+
+function setCache(res, seconds) {
+  if (!seconds || seconds <= 0) return;
+  res.setHeader("Cache-Control", `public, max-age=${seconds}`);
+}
+
+function sendRouteError(res, e, { label = "Request failed" } = {}) {
+  if (e instanceof UpstreamError) {
+    return jsonError(res, 502, {
+      error: label,
+      upstream: {
+        service: e.service,
+        status: e.status,
+        attempt: e.attempt,
+        url: e.url ? trunc(e.url, 300) : null,
+        body: e.body
+      }
+    });
+  }
+  if (e?.name === "AbortError") {
+    return jsonError(res, 504, { error: label, message: "Upstream timeout" });
+  }
+  return jsonError(res, 500, { error: label, message: String(e?.message || e) });
+}
 
 // --- Helpers ---------------------------------------------------------------
 async function makePolygonRequest(path, params = {}) {
   const base = "https://api.polygon.io";
   const qs = new URLSearchParams({ ...params, apiKey: POLYGON_API_KEY }).toString();
   const url = `${base}${path}?${qs}`;
-
-  const resp = await fetch(url);
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    throw new Error(`Polygon ${resp.status}: ${text || resp.statusText}`);
-  }
-  return resp.json();
+  return fetchJsonWithPolicy(url, { service: "Polygon" });
 }
 
 // Massive REST (Float, News, Benzinga) — https://massive.com/docs
 async function makeMassiveRequest(path, params = {}) {
   const qs = new URLSearchParams({ ...params, apiKey: MASSIVE_API_KEY }).toString();
   const url = `${MASSIVE_API_BASE}${path}?${qs}`;
-  const resp = await fetch(url);
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    throw new Error(`Massive ${resp.status}: ${text || resp.statusText}`);
-  }
-  return resp.json();
+  return fetchJsonWithPolicy(url, { service: "Massive" });
 }
 
 // ---------- Fundamentals (optional enrichment) ----------
@@ -433,20 +588,20 @@ if (isDevelopment || ADMIN_TOKEN) {
     if (!isDevelopment) {
       const adminToken = req.headers['x-admin-token'];
       if (adminToken !== ADMIN_TOKEN) {
-        return res.status(401).json({ 
+        return res.status(401).json({
           error: "Unauthorized",
           message: "Missing or invalid x-admin-token header. Header value must equal ADMIN_TOKEN."
         });
       }
     }
-    
+
     // Redact sensitive values - only show last 4 chars
     function redact(value) {
       if (!value || typeof value !== 'string') return null;
       if (value.length <= 4) return '****';
       return '****' + value.slice(-4);
     }
-    
+
     res.json({
       // Dialogflow Configuration (redacted)
       dialogflow: {
@@ -622,12 +777,12 @@ app.post("/api/scan/rct", async (req, res) => {
             rawFloat = Math.floor(fr.free_float);
             sector = (fr.sector || "").trim();
           }
-        } catch (_) {}
+        } catch (_) { }
         if (!sector) {
           try {
             const o = await getTickerOverview(ticker);
             sector = (o?.sector || "").trim();
-          } catch (_) {}
+          } catch (_) { }
         }
 
         const inFloat = rawFloat == null ? true : rawFloat <= rctSettings.float_max;
@@ -694,7 +849,7 @@ app.post("/api/scan/rct", async (req, res) => {
             row.news_header = String(item.title || item.headline || "").trim();
             row.news_link = String(item.url || item.article_url || "").trim();
           }
-        } catch (_) {}
+        } catch (_) { }
         return row;
       });
       results = withNews.concat(rest);
@@ -738,16 +893,16 @@ app.get("/api/float/:symbol", async (req, res) => {
       const results = (data?.results || [])[0] ?? null;
       const out = results
         ? {
-            ticker,
-            results: {
-              ticker: results.ticker,
-              free_float: results.free_float,
-              free_float_percent: results.free_float_percent,
-              effective_date: results.effective_date,
-            },
-            next_url: data?.next_url ?? null,
-            source: "massive",
-          }
+          ticker,
+          results: {
+            ticker: results.ticker,
+            free_float: results.free_float,
+            free_float_percent: results.free_float_percent,
+            effective_date: results.effective_date,
+          },
+          next_url: data?.next_url ?? null,
+          source: "massive",
+        }
         : { ticker, results: null, next_url: data?.next_url ?? null, source: "massive" };
       if (results && !cursor) cacheSet(cacheKey, out);
       return res.json(out);
@@ -764,17 +919,17 @@ app.get("/api/historical/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
     const { days_back = 0, interval = "1" } = req.query;
-    
+
     // Calculate date range
     const end = new Date();
     const start = new Date();
     start.setDate(start.getDate() - parseInt(days_back));
-    
+
     const data = await makePolygonRequest(
       `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/${interval}/minute/${start.toISOString().split('T')[0]}/${end.toISOString().split('T')[0]}`,
       { adjusted: true, sort: "asc", limit: 5000 }
     );
-    
+
     const results = (data?.results || []).map(bar => ({
       t: bar.t,  // timestamp
       o: bar.o,  // open
@@ -784,7 +939,7 @@ app.get("/api/historical/:symbol", async (req, res) => {
       v: bar.v,  // volume
       n: bar.n   // transactions
     }));
-    
+
     res.json({ results });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -873,12 +1028,12 @@ app.get("/api/price/:symbol", async (req, res) => {
     const data = await makePolygonRequest(
       `/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(symbol)}`
     );
-    
+
     const price = data?.ticker?.lastTrade?.p ?? data?.results?.lastTrade?.p ?? null;
     const volume = data?.ticker?.day?.v ?? data?.results?.day?.v ?? null;
     const change = data?.ticker?.todaysChange ?? data?.results?.todaysChange ?? null;
     const changePct = data?.ticker?.todaysChangePerc ?? data?.results?.todaysChangePerc ?? null;
-    
+
     res.json({
       symbol,
       price,
@@ -897,19 +1052,19 @@ app.get("/api/volume/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
     const { days_back = 1 } = req.query;
-    
+
     const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
     const data = await makePolygonRequest(
       `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/minute/${dateStr}/${dateStr}`,
       { adjusted: true, sort: "desc", limit: 1000 }
     );
-    
+
     const results = (data?.results || []).map(bar => ({
       timestamp: bar.t,
       volume: bar.v,
       price: bar.c
     }));
-    
+
     res.json({ results });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -920,15 +1075,15 @@ app.get("/api/volume/:symbol", async (req, res) => {
 app.get("/api/market/status", async (req, res) => {
   try {
     const now = new Date();
-    const nyTime = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
+    const nyTime = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
     const hour = nyTime.getHours();
     const minute = nyTime.getMinutes();
-    
+
     let session = "closed";
     if (hour >= 9 && hour < 16) session = "regular";
     else if (hour >= 4 && hour < 9) session = "premarket";
     else if (hour >= 16 && hour < 20) session = "afterhours";
-    
+
     res.json({
       session,
       time: nyTime.toISOString(),
@@ -946,17 +1101,17 @@ app.get("/api/rsi/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
     const { period = 14, days_back = 30 } = req.query;
-    
+
     const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
     const data = await makePolygonRequest(
       `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
       { adjusted: true, sort: "desc", limit: period + 10 }
     );
-    
+
     // Calculate RSI
     const prices = (data?.results || []).map(bar => bar.c).reverse();
     const rsi = calculateRSI(prices, parseInt(period));
-    
+
     res.json({ rsi, period, symbol });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -968,34 +1123,34 @@ app.get("/api/vwap/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
     const { days_back = 1 } = req.query;
-    
+
     const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
     const data = await makePolygonRequest(
       `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/minute/${dateStr}/${dateStr}`,
       { adjusted: true, sort: "asc", limit: 1000 }
     );
-    
+
     const results = data?.results || [];
     if (results.length === 0) {
       return res.json({ vwap: null, symbol });
     }
-    
+
     // Calculate VWAP
     let totalVolume = 0;
     let totalVolumePrice = 0;
-    
+
     results.forEach(bar => {
       const typicalPrice = (bar.h + bar.l + bar.c) / 3;
       totalVolumePrice += typicalPrice * bar.v;
       totalVolume += bar.v;
     });
-    
+
     const vwap = totalVolume > 0 ? totalVolumePrice / totalVolume : null;
-    
-    res.json({ 
-      vwap: vwap ? parseFloat(vwap.toFixed(4)) : null, 
+
+    res.json({
+      vwap: vwap ? parseFloat(vwap.toFixed(4)) : null,
       symbol,
-      data_points: results.length 
+      data_points: results.length
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1007,26 +1162,26 @@ app.get("/api/macd/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
     const { fast = 12, slow = 26, signal = 9, days_back = 60 } = req.query;
-    
+
     const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
     const data = await makePolygonRequest(
       `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
       { adjusted: true, sort: "desc", limit: Math.max(fast, slow, signal) + 20 }
     );
-    
+
     const prices = (data?.results || []).map(bar => bar.c).reverse();
     if (prices.length < Math.max(fast, slow, signal)) {
       return res.json({ error: "Insufficient data for MACD calculation" });
     }
-    
+
     const macd = calculateMACD(prices, parseInt(fast), parseInt(slow), parseInt(signal));
-    
-    res.json({ 
-      macd, 
-      symbol, 
-      fast_period: parseInt(fast), 
-      slow_period: parseInt(slow), 
-      signal_period: parseInt(signal) 
+
+    res.json({
+      macd,
+      symbol,
+      fast_period: parseInt(fast),
+      slow_period: parseInt(slow),
+      signal_period: parseInt(signal)
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1038,29 +1193,29 @@ app.get("/api/support-resistance/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
     const { days_back = 30 } = req.query;
-    
+
     const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
     const data = await makePolygonRequest(
       `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
       { adjusted: true, sort: "desc", limit: parseInt(days_back) }
     );
-    
+
     const prices = (data?.results || []).map(bar => bar.h);
     const lows = (data?.results || []).map(bar => bar.l);
-    
+
     if (prices.length === 0) {
       return res.json({ support: null, resistance: null, symbol });
     }
-    
+
     // Simple support and resistance calculation
     const resistance = Math.max(...prices);
     const support = Math.min(...lows);
-    
-    res.json({ 
-      support: parseFloat(support.toFixed(4)), 
-      resistance: parseFloat(resistance.toFixed(4)), 
+
+    res.json({
+      support: parseFloat(support.toFixed(4)),
+      resistance: parseFloat(resistance.toFixed(4)),
       symbol,
-      data_points: prices.length 
+      data_points: prices.length
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1072,7 +1227,7 @@ app.get("/api/ema9/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
     const { days_back = 30 } = req.query;
-    
+
     // Try daily data first
     let prices = [];
     try {
@@ -1082,8 +1237,8 @@ app.get("/api/ema9/:symbol", async (req, res) => {
         { adjusted: true, sort: "desc", limit: parseInt(days_back) }
       );
       prices = (data?.results || []).map(bar => bar.c).reverse();
-    } catch (_) {}
-    
+    } catch (_) { }
+
     // If daily data insufficient, try minute data for today
     if (prices.length < 9) {
       try {
@@ -1093,17 +1248,17 @@ app.get("/api/ema9/:symbol", async (req, res) => {
           { adjusted: true, sort: "asc", limit: 1000 }
         );
         prices = (data?.results || []).map(bar => bar.c);
-      } catch (_) {}
+      } catch (_) { }
     }
-    
+
     if (prices.length < 9) {
       return res.json({ error: "Insufficient data for EMA9 calculation (need at least 9 data points)" });
     }
-    
+
     const ema9 = calculateEMA(prices, 9);
-    
-    res.json({ 
-      ema9: parseFloat(ema9.toFixed(4)), 
+
+    res.json({
+      ema9: parseFloat(ema9.toFixed(4)),
       symbol,
       period: 9,
       data_points: prices.length,
@@ -1121,7 +1276,7 @@ app.get("/api/ema21/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
     const { days_back = 60 } = req.query;
-    
+
     // Try daily data first
     let prices = [];
     try {
@@ -1131,8 +1286,8 @@ app.get("/api/ema21/:symbol", async (req, res) => {
         { adjusted: true, sort: "desc", limit: parseInt(days_back) }
       );
       prices = (data?.results || []).map(bar => bar.c).reverse();
-    } catch (_) {}
-    
+    } catch (_) { }
+
     // If daily data insufficient, try minute data for today
     if (prices.length < 21) {
       try {
@@ -1142,17 +1297,17 @@ app.get("/api/ema21/:symbol", async (req, res) => {
           { adjusted: true, sort: "asc", limit: 1000 }
         );
         prices = (data?.results || []).map(bar => bar.c);
-      } catch (_) {}
+      } catch (_) { }
     }
-    
+
     if (prices.length < 21) {
       return res.json({ error: "Insufficient data for EMA21 calculation (need at least 21 data points)" });
     }
-    
+
     const ema21 = calculateEMA(prices, 21);
-    
-    res.json({ 
-      ema21: parseFloat(ema21.toFixed(4)), 
+
+    res.json({
+      ema21: parseFloat(ema21.toFixed(4)),
       symbol,
       period: 21,
       data_points: prices.length,
@@ -1170,7 +1325,7 @@ app.get("/api/ema-trend/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
     const { days_back = 60 } = req.query;
-    
+
     // Try daily data first
     let prices = [];
     try {
@@ -1180,8 +1335,8 @@ app.get("/api/ema-trend/:symbol", async (req, res) => {
         { adjusted: true, sort: "desc", limit: parseInt(days_back) }
       );
       prices = (data?.results || []).map(bar => bar.c).reverse();
-    } catch (_) {}
-    
+    } catch (_) { }
+
     // If daily data insufficient, try minute data for today
     if (prices.length < 21) {
       try {
@@ -1191,17 +1346,17 @@ app.get("/api/ema-trend/:symbol", async (req, res) => {
           { adjusted: true, sort: "asc", limit: 1000 }
         );
         prices = (data?.results || []).map(bar => bar.c);
-      } catch (_) {}
+      } catch (_) { }
     }
-    
+
     if (prices.length < 21) {
       return res.json({ error: "Insufficient data for EMA calculations (need at least 21 data points)" });
     }
-    
+
     const ema9 = calculateEMA(prices, 9);
     const ema21 = calculateEMA(prices, 21);
     const currentPrice = prices[prices.length - 1];
-    
+
     // Determine trend
     let trend = "neutral";
     if (ema9 > ema21 && currentPrice > ema9) {
@@ -1209,21 +1364,21 @@ app.get("/api/ema-trend/:symbol", async (req, res) => {
     } else if (ema9 < ema21 && currentPrice < ema9) {
       trend = "bearish";
     }
-    
+
     // Check for golden/death cross
     let cross_signal = "none";
     if (prices.length >= 22) {
       const prevEma9 = calculateEMA(prices.slice(0, -1), 9);
       const prevEma21 = calculateEMA(prices.slice(0, -1), 21);
-      
+
       if (ema9 > ema21 && prevEma9 <= prevEma21) {
         cross_signal = "golden_cross"; // EMA9 crossed above EMA21
       } else if (ema9 < ema21 && prevEma9 >= prevEma21) {
         cross_signal = "death_cross"; // EMA9 crossed below EMA21
       }
     }
-    
-    res.json({ 
+
+    res.json({
       symbol,
       ema9: parseFloat(ema9.toFixed(4)),
       ema21: parseFloat(ema21.toFixed(4)),
@@ -1246,18 +1401,18 @@ app.get("/api/ema-crossover/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
     const { days_back = 30 } = req.query;
-    
+
     const { dateStr } = await findLastTradingDayNY(parseInt(days_back, 10) + 1);
     const data = await makePolygonRequest(
       `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${dateStr}/${dateStr}`,
       { adjusted: true, sort: "desc", limit: parseInt(days_back) }
     );
-    
+
     const prices = (data?.results || []).map(bar => bar.c).reverse();
     if (prices.length < 21) {
       return res.json({ error: "Insufficient data for crossover analysis" });
     }
-    
+
     // Calculate EMAs for multiple periods to detect crossovers
     const emaValues = [];
     for (let i = 9; i < prices.length; i++) {
@@ -1270,13 +1425,13 @@ app.get("/api/ema-crossover/:symbol", async (req, res) => {
         crossover: ema9 > ema21
       });
     }
-    
+
     // Find recent crossovers
     const crossovers = [];
     for (let i = 1; i < emaValues.length; i++) {
       const prev = emaValues[i - 1];
       const curr = emaValues[i];
-      
+
       if (prev.crossover !== curr.crossover) {
         crossovers.push({
           date_index: curr.date,
@@ -1287,8 +1442,8 @@ app.get("/api/ema-crossover/:symbol", async (req, res) => {
         });
       }
     }
-    
-    res.json({ 
+
+    res.json({
       symbol,
       current_ema9: emaValues[emaValues.length - 1].ema9,
       current_ema21: emaValues[emaValues.length - 1].ema21,
@@ -1306,14 +1461,14 @@ app.get("/api/ema-crossover/:symbol", async (req, res) => {
 // Helper function for RSI calculation
 function calculateRSI(prices, period) {
   if (prices.length < period + 1) return null;
-  
+
   let gains = 0, losses = 0;
   for (let i = 1; i <= period; i++) {
-    const change = prices[i] - prices[i-1];
+    const change = prices[i] - prices[i - 1];
     if (change > 0) gains += change;
     else losses -= change;
   }
-  
+
   const avgGain = gains / period;
   const avgLoss = losses / period;
   const rs = avgGain / avgLoss;
@@ -1323,14 +1478,14 @@ function calculateRSI(prices, period) {
 // Helper function for MACD calculation
 function calculateMACD(prices, fastPeriod, slowPeriod, signalPeriod) {
   if (prices.length < Math.max(fastPeriod, slowPeriod, signalPeriod)) return null;
-  
+
   // Calculate EMAs
   const fastEMA = calculateEMA(prices, fastPeriod);
   const slowEMA = calculateEMA(prices, slowPeriod);
-  
+
   // Calculate MACD line
   const macdLine = fastEMA - slowEMA;
-  
+
   // Calculate signal line (EMA of MACD line)
   const macdValues = [];
   for (let i = 0; i < prices.length; i++) {
@@ -1338,10 +1493,10 @@ function calculateMACD(prices, fastPeriod, slowPeriod, signalPeriod) {
     const slowEMA_i = calculateEMA(prices.slice(0, i + 1), slowPeriod);
     macdValues.push(fastEMA_i - slowEMA_i);
   }
-  
+
   const signalLine = calculateEMA(macdValues, signalPeriod);
   const histogram = macdLine - signalLine;
-  
+
   return {
     macd_line: parseFloat(macdLine.toFixed(4)),
     signal_line: parseFloat(signalLine.toFixed(4)),
@@ -1352,14 +1507,14 @@ function calculateMACD(prices, fastPeriod, slowPeriod, signalPeriod) {
 // Helper function for EMA calculation
 function calculateEMA(prices, period) {
   if (prices.length === 0) return 0;
-  
+
   const multiplier = 2 / (period + 1);
   let ema = prices[0];
-  
+
   for (let i = 1; i < prices.length; i++) {
     ema = (prices[i] * multiplier) + (ema * (1 - multiplier));
   }
-  
+
   return ema;
 }
 
@@ -1372,7 +1527,7 @@ app.get("/symbol/:symbol", async (req, res) => {
     );
     res.json(data);
   } catch (e) {
-    res.status(500).json({ error: "Failed to fetch symbol snapshot", message: String(e.message || e) });
+    sendRouteError(res, e, { label: "Failed to fetch symbol snapshot" });
   }
 });
 
@@ -1380,7 +1535,7 @@ app.get("/symbol/:symbol", async (req, res) => {
 app.get("/gainers", async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || "50", 10);
-    const includeFund = /fund|all/i.test(String(req.query.include||""));
+    const includeFund = /fund|all/i.test(String(req.query.include || ""));
 
     let data;
     try {
@@ -1405,7 +1560,7 @@ app.get("/gainers", async (req, res) => {
 
     res.json({ date: data.date, source: data.source, results: rows });
   } catch (e) {
-    res.status(500).json({ error: "Failed to fetch gainers", message: String(e.message || e) });
+    sendRouteError(res, e, { label: "Failed to fetch gainers" });
   }
 });
 
@@ -1416,7 +1571,7 @@ app.get("/most_active", async (req, res) => {
     const data = await computeMostActive(limit);
     res.json({ date: data.date, source: data.source, results: data.results });
   } catch (e) {
-    res.status(500).json({ error: "Failed to fetch most active", message: String(e.message || e) });
+    sendRouteError(res, e, { label: "Failed to fetch most active" });
   }
 });
 
@@ -1424,7 +1579,7 @@ app.get("/most_active", async (req, res) => {
 app.get("/market/top-gainers", async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || "50", 10);
-    const includeFund = /fund|all/i.test(String(req.query.include||""));
+    const includeFund = /fund|all/i.test(String(req.query.include || ""));
 
     let data;
     try {
@@ -1449,7 +1604,7 @@ app.get("/market/top-gainers", async (req, res) => {
 
     res.json({ date: data.date, source: data.source, results: rows });
   } catch (e) {
-    res.status(500).json({ error: "Failed to fetch gainers", message: String(e.message || e) });
+    sendRouteError(res, e, { label: "Failed to fetch gainers" });
   }
 });
 
@@ -1465,7 +1620,8 @@ app.get("/ohlcv/:symbol", async (req, res) => {
       limit = 5000,
       sort = "asc",
       adjusted = true,
-      session = "all" // 'pre' | 'rth' | 'post' | 'all'
+      session = "all", // 'pre' | 'rth' | 'post' | 'all'
+      include_open = "false" // when session=pre, optionally include 09:30 bar
     } = req.query;
 
     let start, end;
@@ -1487,6 +1643,7 @@ app.get("/ohlcv/:symbol", async (req, res) => {
 
     // Session filter (America/New_York)
     if (session !== "all" && rows.length) {
+      const includeOpen = /^(1|true|yes)$/i.test(String(include_open));
       const inNY = ts => {
         const d = new Date(ts); // ms
         const parts = new Intl.DateTimeFormat("en-US", {
@@ -1497,22 +1654,23 @@ app.get("/ohlcv/:symbol", async (req, res) => {
         const mm = +parts.find(p => p.type === "minute").value;
         return [hh, mm];
       };
-      const isPre  = (h,m) => (h > 3 && (h < 9 || (h === 9 && m < 30)));   // 04:00–09:29
-      const isRth  = (h,m) => (h > 9 || (h === 9 && m >= 30)) && h < 16;    // 09:30–15:59
-      const isPost = (h,m) => (h >= 16 && h < 20);                          // 16:00–19:59
+      const isPre = (h, m) => (h > 3 && (h < 9 || (h === 9 && (m < 30 || (includeOpen && m === 30)))));   // 04:00–09:29 (+09:30 optional)
+      const isRth = (h, m) => (h > 9 || (h === 9 && m >= 30)) && h < 16;    // 09:30–15:59
+      const isPost = (h, m) => (h >= 16 && h < 20);                          // 16:00–19:59
 
       rows = rows.filter(bar => {
         const [h, m] = inNY(bar.t);
-        if (session === "pre")  return isPre(h,m);
-        if (session === "rth")  return isRth(h,m);
-        if (session === "post") return isPost(h,m);
+        if (session === "pre") return isPre(h, m);
+        if (session === "rth") return isRth(h, m);
+        if (session === "post") return isPost(h, m);
         return true;
       });
     }
 
-    res.json({ results: rows });
+    const totalVolume = rows.reduce((sum, bar) => sum + (Number(bar?.v) || 0), 0);
+    res.json({ session, totalVolume, results: rows });
   } catch (e) {
-    res.status(500).json({ error: "Failed to fetch OHLCV", message: String(e.message || e) });
+    sendRouteError(res, e, { label: "Failed to fetch OHLCV" });
   }
 });
 
@@ -1530,7 +1688,7 @@ app.get("/price/:symbol", async (req, res) => {
         { adjusted: true, sort: "desc", limit: 1 }
       );
       if (aggs?.results?.length) price = aggs.results[0].c;
-    } catch (_) {}
+    } catch (_) { }
 
     // Snapshot last trade fallback (handles after-hours / entitlement cases)
     if (price == null) {
@@ -1538,14 +1696,14 @@ app.get("/price/:symbol", async (req, res) => {
         `/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(symbol)}`
       );
       price = snap?.ticker?.lastTrade?.p
-           ?? snap?.results?.lastTrade?.p
-           ?? snap?.lastTrade?.p
-           ?? null;
+        ?? snap?.results?.lastTrade?.p
+        ?? snap?.lastTrade?.p
+        ?? null;
     }
 
     res.json({ symbol, price });
   } catch (e) {
-    res.status(500).json({ symbol, price: null, error: String(e.message || e) });
+    sendRouteError(res, e, { label: "Failed to fetch latest price" });
   }
 });
 
@@ -1558,9 +1716,10 @@ app.get("/previous_close/:symbol", async (req, res) => {
       { adjusted: true }
     );
     const prev = Array.isArray(data?.results) ? data.results[0] : null;
+    setCache(res, 60 * 60); // 1 hour
     res.json({ symbol, previousClose: prev?.c ?? null, raw: prev || null });
   } catch (e) {
-    res.status(500).json({ error: "Failed to fetch previous close", message: String(e.message || e) });
+    sendRouteError(res, e, { label: "Failed to fetch previous close" });
   }
 });
 
@@ -1589,9 +1748,10 @@ app.get("/historical/:symbol", async (req, res) => {
       t: bar.t   // timestamp (ms)
     }));
 
+    setCache(res, 60); // 1 minute
     res.json({ results });
   } catch (e) {
-    res.status(500).json({ error: "Failed to fetch historical data", message: String(e.message || e) });
+    sendRouteError(res, e, { label: "Failed to fetch historical data" });
   }
 });
 
@@ -1609,7 +1769,7 @@ app.get("/quote/:symbol", async (req, res) => {
         { adjusted: true, sort: "desc", limit: 1 }
       );
       if (aggs?.results?.length) price = aggs.results[0].c;
-    } catch (_) {}
+    } catch (_) { }
 
     // Snapshot fallback
     if (price == null) {
@@ -1617,9 +1777,9 @@ app.get("/quote/:symbol", async (req, res) => {
         `/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(symbol)}`
       );
       price = snap?.ticker?.lastTrade?.p
-           ?? snap?.results?.lastTrade?.p
-           ?? snap?.lastTrade?.p
-           ?? null;
+        ?? snap?.results?.lastTrade?.p
+        ?? snap?.lastTrade?.p
+        ?? null;
     }
 
     // Previous close for change calc (optional but provided for parity)
@@ -1630,7 +1790,7 @@ app.get("/quote/:symbol", async (req, res) => {
         { adjusted: true }
       );
       prevClose = prevData?.results?.[0]?.c ?? null;
-    } catch (_) {}
+    } catch (_) { }
 
     res.json({
       results: {
@@ -1639,7 +1799,7 @@ app.get("/quote/:symbol", async (req, res) => {
       }
     });
   } catch (e) {
-    res.status(500).json({ error: "Failed to fetch quote", message: String(e.message || e) });
+    sendRouteError(res, e, { label: "Failed to fetch quote" });
   }
 });
 
@@ -1687,7 +1847,7 @@ app.get("/api/shared-tickers", (req, res) => {
     const tickers = Array.from(sharedTickers.values());
     res.json({ success: true, tickers });
   } catch (e) {
-    res.status(500).json({ error: "Failed to fetch shared tickers", message: String(e.message || e) });
+    sendRouteError(res, e, { label: "Failed to fetch shared tickers" });
   }
 });
 
@@ -1695,12 +1855,12 @@ app.get("/api/shared-tickers", (req, res) => {
 app.post("/api/shared-tickers", (req, res) => {
   try {
     checkTradingDayReset();
-    
+
     // Check if user is in developer mode
     if (!isDeveloperMode(req)) {
       return res.status(403).json({ error: "Only developer mode can add shared tickers" });
     }
-    
+
     const { symbol } = req.body;
     if (!symbol) {
       return res.status(400).json({ error: "Symbol is required" });
@@ -1716,7 +1876,7 @@ app.post("/api/shared-tickers", (req, res) => {
     });
     res.json({ success: true, ticker: sharedTickers.get(ticker) });
   } catch (e) {
-    res.status(500).json({ error: "Failed to add shared ticker", message: String(e.message || e) });
+    sendRouteError(res, e, { label: "Failed to add shared ticker" });
   }
 });
 
@@ -1760,9 +1920,9 @@ wss.on("connection", (wsClient) => {
   upstream.on("open", () => {
     upstream.send(JSON.stringify({ action: "auth", params: POLYGON_API_KEY }));
   });
-  upstream.on("message", (msg) => { try { wsClient.send(msg.toString()); } catch {} });
-  wsClient.on("message", (msg) => { try { if (upstream.readyState === WebSocket.OPEN) upstream.send(msg.toString()); } catch {} });
-  const cleanup = () => { try { wsClient.close(); } catch {}; try { upstream.close(); } catch {}; };
+  upstream.on("message", (msg) => { try { wsClient.send(msg.toString()); } catch { } });
+  wsClient.on("message", (msg) => { try { if (upstream.readyState === WebSocket.OPEN) upstream.send(msg.toString()); } catch { } });
+  const cleanup = () => { try { wsClient.close(); } catch { }; try { upstream.close(); } catch { }; };
   wsClient.on("close", cleanup); wsClient.on("error", cleanup);
   upstream.on("close", cleanup); upstream.on("error", cleanup);
 });
