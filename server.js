@@ -541,6 +541,7 @@ const ROUTE_MANIFEST = [
   { method: "GET", path: "/historical/:symbol", desc: "Day/minute historical" },
   { method: "GET", path: "/quote/:symbol", desc: "Quote (scanner)" },
   { method: "WS", path: "/ws", desc: "Polygon WS passthrough" },
+  { method: "WS", path: "/ws/scanner", desc: "Normalized scanner stream (Massive minute aggregates + server-controlled universe)" },
 ];
 
 // --- Routes ----------------------------------------------------------------
