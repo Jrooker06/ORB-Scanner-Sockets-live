@@ -1903,12 +1903,278 @@ app.use((req, res) => {
 
 // --- WebSocket passthrough (optional) --------------------------------------
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ noServer: true });
+const wss = new WebSocket.Server({ noServer: true }); // /ws (Polygon passthrough)
+const scannerWss = new WebSocket.Server({ noServer: true }); // /ws/scanner (normalized scanner stream)
+
+// --- Scanner stream (Massive-backed, normalized) ----------------------------
+// Server emits only normalized payloads to clients:
+//  { type: "snapshot"|"upsert"|"remove"|"heartbeat"|"error", ... }
+const MASSIVE_STOCKS_WS_URL = String(process.env.MASSIVE_STOCKS_WS_URL || "").trim();
+const SCANNER_UNIVERSE_LIMIT = Math.max(50, Math.min(500, parseInt(process.env.SCANNER_UNIVERSE_LIMIT || "500", 10) || 500));
+const SCANNER_UNIVERSE_REFRESH_MS = Math.max(5000, parseInt(process.env.SCANNER_UNIVERSE_REFRESH_MS || "15000", 10) || 15000);
+
+function wsUnauthorized(socket) {
+  try {
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+  } catch { }
+  try { socket.destroy(); } catch { }
+}
+
+function parseWsUrl(request) {
+  try {
+    return new URL(request.url, "http://localhost");
+  } catch {
+    return null;
+  }
+}
+
+function requireAppTokenWs(request, socket) {
+  if (!APP_TOKEN) return true;
+  const headerToken = request.headers["x-app-token"];
+  if (headerToken && headerToken === APP_TOKEN) return true;
+  const u = parseWsUrl(request);
+  const qpToken = u ? (u.searchParams.get("app_token") || u.searchParams.get("APP_TOKEN")) : null;
+  if (qpToken && qpToken === APP_TOKEN) return true;
+  wsUnauthorized(socket);
+  return false;
+}
+
+function safeSend(ws, payload) {
+  try { ws.send(JSON.stringify(payload)); } catch { }
+}
+
+function nowTs() { return Date.now(); }
+function isoNow() { return new Date().toISOString(); }
+
+// Minimal normalized row map; enrichment can be layered in later.
+const scannerRowsBySymbol = new Map(); // symbol -> ScannerRow
+let scannerUniverse = new Set();
+
+// One upstream Massive connection shared across all scanner clients.
+let massiveUpstream = null;
+let massiveUpstreamOpen = false;
+let massiveSubscribed = new Set();
+let massiveReconnectTimer = null;
+
+function massiveSend(payload) {
+  try {
+    if (massiveUpstream && massiveUpstream.readyState === WebSocket.OPEN) {
+      massiveUpstream.send(JSON.stringify(payload));
+    }
+  } catch { }
+}
+
+function massiveSubscribe(symbols) {
+  const add = symbols.filter(Boolean).map(s => s.toUpperCase());
+  if (!add.length) return;
+  const params = add.map(s => `AM.${s}`).join(",");
+  massiveSend({ action: "subscribe", params });
+  for (const s of add) massiveSubscribed.add(s);
+}
+
+function massiveUnsubscribe(symbols) {
+  const rem = symbols.filter(Boolean).map(s => s.toUpperCase());
+  if (!rem.length) return;
+  const params = rem.map(s => `AM.${s}`).join(",");
+  massiveSend({ action: "unsubscribe", params });
+  for (const s of rem) massiveSubscribed.delete(s);
+}
+
+function ensureMassiveUpstream() {
+  if (!MASSIVE_STOCKS_WS_URL) return;
+  if (massiveUpstream && (massiveUpstream.readyState === WebSocket.OPEN || massiveUpstream.readyState === WebSocket.CONNECTING)) return;
+  try { if (massiveUpstream) massiveUpstream.close(); } catch { }
+  massiveUpstream = new WebSocket(MASSIVE_STOCKS_WS_URL);
+  massiveUpstreamOpen = false;
+
+  massiveUpstream.on("open", () => {
+    massiveUpstreamOpen = true;
+    // Default auth message (override by MASSIVE_WS_AUTH_JSON if needed).
+    const override = String(process.env.MASSIVE_WS_AUTH_JSON || "").trim();
+    if (override) {
+      try {
+        const parsed = JSON.parse(override);
+        massiveSend(parsed);
+      } catch {
+        massiveSend({ action: "auth", params: MASSIVE_API_KEY });
+      }
+    } else {
+      massiveSend({ action: "auth", params: MASSIVE_API_KEY });
+    }
+    // Re-subscribe current universe
+    massiveSubscribed = new Set();
+    massiveSubscribe(Array.from(scannerUniverse));
+  });
+
+  massiveUpstream.on("message", (msg) => {
+    const raw = msg.toString();
+    let parsed = null;
+    try { parsed = JSON.parse(raw); } catch { return; }
+    const arr = Array.isArray(parsed) ? parsed : [parsed];
+    for (const item of arr) {
+      if (!item || typeof item !== "object") continue;
+      const ev = item.ev || item.event || item.type;
+      if (ev !== "AM") continue;
+      const sym = String(item.sym || item.symbol || item.s || "").toUpperCase();
+      if (!sym) continue;
+      if (!scannerUniverse.has(sym)) continue;
+
+      const last = scannerRowsBySymbol.get(sym) || null;
+      const lastPrice = typeof item.c === "number" ? item.c : (last ? last.lastPrice : null);
+      const candleVolume1m = typeof item.v === "number" ? item.v : (last ? last.candleVolume1m : null);
+      const highOfDay = typeof item.h === "number" ? item.h : (last ? last.highOfDay : null);
+      const lowOfDay = typeof item.l === "number" ? item.l : (last ? last.lowOfDay : null);
+
+      const next = Object.assign({}, last || {}, {
+        symbol: sym,
+        session: last?.session || "premarket",
+        lastPrice: lastPrice ?? null,
+        candleVolume1m: candleVolume1m ?? null,
+        highOfDay: highOfDay ?? null,
+        lowOfDay: lowOfDay ?? null,
+        percentFromHigh:
+          lastPrice != null && highOfDay != null && highOfDay > 0 ? ((lastPrice - highOfDay) / highOfDay) * 100 : (last ? last.percentFromHigh : null),
+        percentFromLow:
+          lastPrice != null && lowOfDay != null && lowOfDay > 0 ? ((lastPrice - lowOfDay) / lowOfDay) * 100 : (last ? last.percentFromLow : null),
+        lastUpdated: isoNow(),
+      });
+      scannerRowsBySymbol.set(sym, next);
+      broadcastScanner({ type: "upsert", rows: [next], ts: nowTs() });
+    }
+  });
+
+  const onUpstreamClosed = (label) => {
+    massiveUpstreamOpen = false;
+    broadcastScanner({ type: "error", message: `Massive upstream ${label}`, ts: nowTs() });
+    if (massiveReconnectTimer) return;
+    massiveReconnectTimer = setTimeout(() => {
+      massiveReconnectTimer = null;
+      ensureMassiveUpstream();
+    }, 1500);
+  };
+  massiveUpstream.on("close", () => onUpstreamClosed("closed"));
+  massiveUpstream.on("error", () => onUpstreamClosed("error"));
+}
+
+function computeBaseRowFromUniverseRow(u) {
+  const symbol = String(u.ticker || "").toUpperCase();
+  const lastPrice = typeof u.last === "number" ? u.last : (typeof u.close === "number" ? u.close : null);
+  const changeDollar = typeof u.change === "number" ? u.change : null;
+  const changePercent = typeof u.pctChange === "number" ? u.pctChange : null;
+  const prevClose = (lastPrice != null && changeDollar != null) ? (lastPrice - changeDollar) : null;
+  const highOfDay = null;
+  const lowOfDay = null;
+
+  return {
+    symbol,
+    session: "premarket",
+    lastPrice,
+    changeDollar,
+    changePercent,
+    dailyVolume: typeof u.volume === "number" ? u.volume : null,
+    candleVolume1m: null,
+    relativeVolume: null,
+    premarketVolume: null,
+    postmarketVolume: null,
+    floatShares: typeof u.sharesOutstanding === "number" ? u.sharesOutstanding : null,
+    marketCap: typeof u.marketCap === "number" ? u.marketCap : null,
+    shortRatio: null,
+    gapPercent:
+      lastPrice != null && prevClose != null && prevClose > 0 ? ((lastPrice - prevClose) / prevClose) * 100 : changePercent,
+    vwapDistancePercent: null,
+    ema9DistancePercent: null,
+    haltStatus: null,
+    hasNews: false,
+    latestNewsTime: null,
+    latestNewsHeadline: "",
+    sparklineData: [],
+    trendDirection: "flat",
+    lastUpdated: isoNow(),
+    sector: typeof u.sector === "string" ? u.sector : null,
+    catalystType: null,
+    highOfDay,
+    lowOfDay,
+    percentFromHigh: null,
+    percentFromLow: null,
+    floatRotation: null,
+  };
+}
+
+const scannerClients = new Set();
+function broadcastScanner(msg) {
+  for (const ws of scannerClients) safeSend(ws, msg);
+}
+
+async function recomputeScannerUniverse() {
+  try {
+    const data = await computeSnapshotGainers(SCANNER_UNIVERSE_LIMIT);
+    const nextSymbols = new Set((data?.results || []).map(r => String(r.ticker || "").toUpperCase()).filter(Boolean));
+
+    // delta
+    const removed = [];
+    const added = [];
+    for (const s of nextSymbols) if (!scannerUniverse.has(s)) added.push(s);
+    for (const s of scannerUniverse) if (!nextSymbols.has(s)) removed.push(s);
+
+    scannerUniverse = nextSymbols;
+
+    // Maintain base rows for current universe.
+    for (const row of (data?.results || [])) {
+      const sym = String(row.ticker || "").toUpperCase();
+      if (!sym) continue;
+      const base = computeBaseRowFromUniverseRow(row);
+      const existing = scannerRowsBySymbol.get(sym);
+      scannerRowsBySymbol.set(sym, Object.assign({}, base, existing || {}));
+    }
+    for (const s of removed) scannerRowsBySymbol.delete(s);
+
+    if (MASSIVE_STOCKS_WS_URL) {
+      ensureMassiveUpstream();
+      if (massiveUpstreamOpen) {
+        if (removed.length) massiveUnsubscribe(removed);
+        if (added.length) massiveSubscribe(added);
+      }
+    }
+
+    if (removed.length) broadcastScanner({ type: "remove", symbols: removed, ts: nowTs() });
+    // snapshot gives clients an authoritative view of current universe/base fields
+    broadcastScanner({ type: "snapshot", rows: Array.from(scannerRowsBySymbol.values()), ts: nowTs() });
+  } catch (e) {
+    broadcastScanner({ type: "error", message: String(e?.message || e || "Universe recompute failed"), ts: nowTs() });
+  }
+}
+
+let scannerUniverseTimer = null;
+function startScannerUniverseLoop() {
+  if (scannerUniverseTimer) return;
+  // Compute immediately, then on interval.
+  void recomputeScannerUniverse();
+  scannerUniverseTimer = setInterval(() => { void recomputeScannerUniverse(); }, SCANNER_UNIVERSE_REFRESH_MS);
+}
+
+let scannerHeartbeatTimer = null;
+function startScannerHeartbeat() {
+  if (scannerHeartbeatTimer) return;
+  scannerHeartbeatTimer = setInterval(() => {
+    broadcastScanner({ type: "heartbeat", ts: nowTs() });
+  }, 10000);
+}
 
 server.on("upgrade", (request, socket, head) => {
-  if (request.url === "/ws") {
+  // Protect WebSockets with the same APP_TOKEN policy.
+  if (!requireAppTokenWs(request, socket)) return;
+
+  // Note: request.url can include querystring. We only match the pathname.
+  const u = parseWsUrl(request);
+  const pathname = u ? u.pathname : request.url;
+
+  if (pathname === "/ws") {
     wss.handleUpgrade(request, socket, head, wsClient => {
       wss.emit("connection", wsClient, request);
+    });
+  } else if (pathname === "/ws/scanner") {
+    scannerWss.handleUpgrade(request, socket, head, wsClient => {
+      scannerWss.emit("connection", wsClient, request);
     });
   } else {
     socket.destroy();
@@ -1927,12 +2193,42 @@ wss.on("connection", (wsClient) => {
   upstream.on("close", cleanup); upstream.on("error", cleanup);
 });
 
+scannerWss.on("connection", (wsClient) => {
+  scannerClients.add(wsClient);
+
+  startScannerUniverseLoop();
+  startScannerHeartbeat();
+  if (MASSIVE_STOCKS_WS_URL) ensureMassiveUpstream();
+
+  // Immediately emit snapshot.
+  safeSend(wsClient, { type: "snapshot", rows: Array.from(scannerRowsBySymbol.values()), ts: nowTs() });
+
+  wsClient.on("message", (msg) => {
+    // Optional: accept {type:"subscribe",channel:"scanner",session:"premarket|market|postmarket|all"}
+    // For now, session selection is server-driven; message is accepted for forward-compat but ignored.
+    try {
+      const parsed = JSON.parse(msg.toString());
+      if (parsed && parsed.type === "subscribe") {
+        // no-op (server controls universe/session); keep connection alive
+      }
+    } catch { }
+  });
+
+  const cleanup = () => {
+    scannerClients.delete(wsClient);
+    try { wsClient.close(); } catch { }
+  };
+  wsClient.on("close", cleanup);
+  wsClient.on("error", cleanup);
+});
+
 // --- Start -----------------------------------------------------------------
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ polygon-proxy listening on ${PORT}`);
   console.log(`   GET  http://0.0.0.0:${PORT}/gainers`);
   console.log(`   GET  http://0.0.0.0:${PORT}/api/gainers`);
   console.log(`   WS   ws://0.0.0.0:${PORT}/ws`);
+  console.log(`   WS   ws://0.0.0.0:${PORT}/ws/scanner`);
 });
 
 // Graceful shutdown: stop accepting new connections, then exit
