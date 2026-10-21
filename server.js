@@ -424,6 +424,202 @@ async function fetchGrouped(dateStr) {
   });
 }
 
+function etClock(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(now);
+  const read = (type) => parts.find((part) => part.type === type)?.value;
+  let hour = Number(read("hour"));
+  if (hour === 24) hour = 0;
+  return {
+    date: `${read("year")}-${read("month")}-${read("day")}`,
+    minutes: hour * 60 + Number(read("minute")),
+  };
+}
+
+function normalizeEpoch(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (n > 1e17) return Math.round(n / 1e6);
+  if (n > 1e14) return Math.round(n / 1e3);
+  if (n > 1e11) return Math.round(n);
+  return Math.round(n * 1000);
+}
+
+const EARLY_CLOSE_DATES = new Set([
+  "2024-07-03", "2024-11-29", "2024-12-24",
+  "2025-07-03", "2025-11-28", "2025-12-24",
+  "2026-11-27", "2026-12-24",
+  "2027-07-02", "2027-11-26",
+]);
+const GROUPED_CACHE_MS = 10 * 60 * 1000;
+const GROUPED_CACHE_MAX = 2;
+const GROUPED_RETURN_CAP = 2500;
+const GROUPED_THIN_SYMBOLS = 1000;
+const GROUPED_MAX_AGE_DAYS = 120;
+const GROUPED_DAILY_CACHE = new Map();
+const groupedInflight = new Map();
+const groupedRateMap = new Map();
+const premarketRateMap = new Map();
+
+function scheduledCloseMinutes(date) {
+  return EARLY_CLOSE_DATES.has(date) ? 13 * 60 : 16 * 60;
+}
+
+function previousCalendarDate(date) {
+  const time = new Date(`${date}T00:00:00Z`);
+  time.setUTCDate(time.getUTCDate() - 1);
+  return time.toISOString().slice(0, 10);
+}
+
+function calendarAgeDays(older, newer) {
+  const left = Date.parse(`${older}T00:00:00Z`);
+  const right = Date.parse(`${newer}T00:00:00Z`);
+  return Math.round((right - left) / 86400000);
+}
+
+function isWeekendDate(date) {
+  const day = new Date(`${date}T00:00:00Z`).getUTCDay();
+  return day === 0 || day === 6;
+}
+
+function rememberGrouped(cacheKey, payload) {
+  GROUPED_DAILY_CACHE.set(cacheKey, { at: Date.now(), payload });
+  while (GROUPED_DAILY_CACHE.size > GROUPED_CACHE_MAX) {
+    const oldest = GROUPED_DAILY_CACHE.keys().next().value;
+    GROUPED_DAILY_CACHE.delete(oldest);
+  }
+}
+
+function mapGroupedBar(row) {
+  if (!row || typeof row.T !== "string") return null;
+  const open = row.o;
+  const high = row.h;
+  const low = row.l;
+  const close = row.c;
+  if (![open, high, low, close].every((value) => typeof value === "number" && Number.isFinite(value))) return null;
+  if (high < low) return null;
+  const volume = typeof row.v === "number" && Number.isFinite(row.v) ? row.v : 0;
+  return { symbol: row.T.toUpperCase(), open, high, low, close, volume };
+}
+
+function readGroupedBounds(query) {
+  const minClose = Number(query.minClose ?? 0);
+  const maxClose = Number(query.maxClose ?? 100000);
+  const minVolume = Number(query.minVolume ?? 0);
+  if (![minClose, maxClose, minVolume].every(Number.isFinite)) return null;
+  if (minClose < 0 || maxClose > 100000 || minClose > maxClose || minVolume < 0 || minVolume > 1e12) return null;
+  return { minClose, maxClose, minVolume };
+}
+
+function checkWindowRate(map, ip, max) {
+  const now = Date.now();
+  if (map.size > 2000) {
+    for (const [key, record] of map.entries()) {
+      if (now - record.since > 60_000) map.delete(key);
+    }
+  }
+  const record = map.get(ip);
+  if (!record || now - record.since > 60_000) {
+    map.set(ip, { count: 1, since: now });
+    return true;
+  }
+  record.count += 1;
+  return record.count <= max;
+}
+
+function providerRouteError(res, error, label) {
+  const status = error instanceof UpstreamError ? error.status : null;
+  if (status === 401 || status === 403) {
+    return res.status(502).json({
+      code: "PROVIDER_UNAUTHORIZED",
+      message: `The market-data provider refused ${label}. No bars were returned.`,
+    });
+  }
+  if (status === 429) {
+    return res.status(429).json({
+      code: "PROVIDER_RATE_LIMITED",
+      message: `The market-data provider rate limit was reached for ${label}. No bars were returned.`,
+    });
+  }
+  if (error?.name === "AbortError" || String(error?.message || "").toLowerCase().includes("timeout")) {
+    return res.status(504).json({
+      code: "PROVIDER_TIMEOUT",
+      message: `The market-data provider timed out for ${label}. No bars were returned.`,
+    });
+  }
+  return res.status(502).json({
+    code: "PROVIDER_UNAVAILABLE",
+    message: `${label} is unavailable. No bars were returned.`,
+  });
+}
+
+async function loadGroupedSessions(cutoff, sessions, bounds, today) {
+  const collected = [];
+  let cursor = cutoff;
+  let symbolSet = null;
+  let coverage = null;
+  for (let step = 0; step < sessions * 4 && collected.length < sessions; step += 1) {
+    if (calendarAgeDays(cursor, cutoff) > GROUPED_MAX_AGE_DAYS) break;
+    if (!isWeekendDate(cursor)) {
+      const grouped = await fetchGrouped(cursor);
+      const bars = (Array.isArray(grouped?.results) ? grouped.results : []).map(mapGroupedBar).filter(Boolean);
+      if (cursor === cutoff) {
+        if (bars.length === 0) return { missing: true };
+        if (cursor === today && bars.length < GROUPED_THIN_SYMBOLS) return { notFinal: true, count: bars.length };
+        const eligible = bars
+          .filter((bar) => bar.close >= bounds.minClose && bar.close <= bounds.maxClose && bar.volume >= bounds.minVolume)
+          .sort((left, right) => right.volume - left.volume);
+        const truncated = eligible.length > GROUPED_RETURN_CAP;
+        const kept = truncated ? eligible.slice(0, GROUPED_RETURN_CAP) : eligible;
+        symbolSet = new Set(kept.map((bar) => bar.symbol));
+        coverage = {
+          cutoffSymbols: bars.length,
+          matchedBounds: eligible.length,
+          symbolsReturned: kept.length,
+          truncated,
+          thin: bars.length < GROUPED_THIN_SYMBOLS,
+          filters: bounds,
+        };
+        collected.push({ date: cursor, bars: kept });
+      } else if (symbolSet) {
+        collected.push({ date: cursor, bars: bars.filter((bar) => symbolSet.has(bar.symbol)) });
+      }
+    }
+    cursor = previousCalendarDate(cursor);
+  }
+  collected.reverse();
+  if (collected.at(-1)?.date !== cutoff || !coverage) return { missing: true };
+  return {
+    sessions: collected,
+    coverage,
+    finality: cutoff === today ? "provider-returned-after-scheduled-close" : "provider-returned-historical",
+  };
+}
+
+async function completedGroupedSessions(cutoff, sessions, bounds, today) {
+  const cacheKey = `${cutoff}:${sessions}:${bounds.minClose}:${bounds.maxClose}:${bounds.minVolume}`;
+  const cached = GROUPED_DAILY_CACHE.get(cacheKey);
+  if (cached && Date.now() - cached.at < GROUPED_CACHE_MS) return cached.payload;
+  if (groupedInflight.has(cacheKey)) return groupedInflight.get(cacheKey);
+  const job = loadGroupedSessions(cutoff, sessions, bounds, today)
+    .then((payload) => {
+      if (payload?.sessions) rememberGrouped(cacheKey, payload);
+      return payload;
+    })
+    .finally(() => groupedInflight.delete(cacheKey));
+  groupedInflight.set(cacheKey, job);
+  return job;
+}
+
+
+
 // Walk back up to N NY-calendar days to find a trading day with grouped results
 async function findLastTradingDayNY(maxBack = 15) {
   let d = new Date();
@@ -517,7 +713,7 @@ async function computeMostActive(limit = 50) {
 }
 
 // --- Route manifest (version + overview for clients) -----------------------
-const API_VERSION = "1.0.7";
+const API_VERSION = "1.0.8";
 const ROUTE_MANIFEST = [
   { method: "GET", path: "/health", desc: "Basic health" },
   { method: "GET", path: "/api", desc: "Route manifest + version" },
@@ -525,6 +721,8 @@ const ROUTE_MANIFEST = [
   { method: "GET", path: "/api/gainers", desc: "Top gainers (scanner)" },
   { method: "POST", path: "/api/scan/rct", desc: "Server-side batch RCT scan" },
   { method: "GET", path: "/api/market-tickers", desc: "Whole market tickers (all US stocks from last trading day)" },
+  { method: "GET", path: "/api/grouped-daily", desc: "Adjusted grouped daily bars through a completed cutoff" },
+  { method: "GET", path: "/api/premarket/:symbol", desc: "Snapshot print for premarket classification" },
   { method: "GET", path: "/api/float/:symbol", desc: "Free float (Massive); ?cursor=" },
   { method: "GET", path: "/api/historical/:symbol", desc: "Historical price data" },
   { method: "GET", path: "/api/news/:symbol", desc: "News; ?source=benzinga|stocks&limit=&cursor=" },
@@ -1894,6 +2092,105 @@ app.delete("/api/shared-tickers/:symbol", (req, res) => {
     }
   } catch (e) {
     res.status(500).json({ error: "Failed to remove shared ticker", message: String(e.message || e) });
+  }
+});
+
+app.get("/api/grouped-daily", async (req, res) => {
+  const ip = req.ip || req.socket?.remoteAddress || "unknown";
+  if (!checkWindowRate(groupedRateMap, ip, 4)) {
+    return res.status(429).json({ code: "RATE_LIMITED", message: "Grouped daily rate limit exceeded. No bars were returned." });
+  }
+  try {
+    const sessions = Math.min(Math.max(parseInt(req.query.sessions || "12", 10) || 12, 4), 15);
+    const cutoff = String(req.query.cutoff || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(cutoff) || Number.isNaN(Date.parse(`${cutoff}T00:00:00Z`))) {
+      return res.status(400).json({ code: "INVALID_REQUEST", message: "Cutoff must be YYYY-MM-DD." });
+    }
+    const bounds = readGroupedBounds(req.query);
+    if (!bounds) return res.status(400).json({ code: "INVALID_REQUEST", message: "Price or volume bounds are outside the allowed range." });
+    const clock = etClock();
+    if (calendarAgeDays(cutoff, clock.date) > GROUPED_MAX_AGE_DAYS || cutoff > clock.date) {
+      return res.status(400).json({
+        code: cutoff > clock.date ? "INCOMPLETE_SESSION" : "BOUNDED_HISTORY",
+        message: cutoff > clock.date
+          ? "That session has not opened. No bars were returned."
+          : "That cutoff is outside the 120-day history bound. No bars were returned.",
+        cutoff,
+      });
+    }
+    if (isWeekendDate(cutoff)) {
+      return res.status(400).json({ code: "INVALID_REQUEST", message: "Cutoff is not an exchange session. No bars were returned." });
+    }
+    const closeMinutes = scheduledCloseMinutes(cutoff);
+    if (cutoff === clock.date && clock.minutes < closeMinutes) {
+      return res.status(409).json({
+        code: "INCOMPLETE_SESSION",
+        message: `The ${closeMinutes === 13 * 60 ? "13:00" : "16:00"} America/New_York close has not passed. The incomplete bar was excluded.`,
+        cutoff,
+        scheduledClose: closeMinutes === 13 * 60 ? "13:00" : "16:00",
+      });
+    }
+    const collected = await completedGroupedSessions(cutoff, sessions, bounds, clock.date);
+    if (collected?.notFinal) {
+      return res.status(409).json({
+        code: "NOT_FINAL",
+        message: "The scheduled close has passed, but the provider has not published a complete grouped daily bar. No symbols were returned.",
+        cutoff,
+        scheduledClose: closeMinutes === 13 * 60 ? "13:00" : "16:00",
+        symbolsSeen: collected.count,
+      });
+    }
+    if (!collected?.sessions) {
+      return res.status(404).json({
+        code: "NO_COMPLETED_SESSION",
+        message: "No grouped daily bars are available for the requested cutoff. No symbols were substituted.",
+        cutoff,
+      });
+    }
+    res.setHeader("Cache-Control", "private, max-age=60");
+    res.json({
+      source: "polygon-grouped-daily",
+      adjusted: true,
+      timezone: "America/New_York",
+      delay: "provider-plan",
+      cutoff,
+      scheduledClose: closeMinutes === 13 * 60 ? "13:00" : "16:00",
+      finality: collected.finality,
+      retrievedAt: new Date().toISOString(),
+      coverage: collected.coverage,
+      sessions: collected.sessions,
+    });
+  } catch (error) {
+    return providerRouteError(res, error, "grouped daily bars");
+  }
+});
+
+app.get("/api/premarket/:symbol", async (req, res) => {
+  const ip = req.ip || req.socket?.remoteAddress || "unknown";
+  if (!checkWindowRate(premarketRateMap, ip, 120)) {
+    return res.status(429).json({ code: "RATE_LIMITED", message: "Premarket rate limit exceeded. No price was returned." });
+  }
+  try {
+    const symbol = String(req.params.symbol || "").toUpperCase();
+    const data = await makePolygonRequest(
+      `/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(symbol)}`,
+    );
+    const ticker = data?.ticker || data?.results || {};
+    const trade = ticker.lastTrade || {};
+    const epoch = normalizeEpoch(trade.t);
+    res.setHeader("Cache-Control", "private, max-age=15");
+    res.json({
+      symbol,
+      source: "polygon-stock-snapshot",
+      delay: "provider-plan",
+      timezone: "America/New_York",
+      price: typeof trade.p === "number" ? trade.p : null,
+      tradeTimestamp: epoch ? new Date(epoch).toISOString() : null,
+      previousSessionClose: typeof ticker.prevDay?.c === "number" ? ticker.prevDay.c : null,
+      retrievedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    return providerRouteError(res, error, "the premarket snapshot");
   }
 });
 
